@@ -1,938 +1,1090 @@
+"""
+╔══════════════════════════════════════════════════════════════════════════╗
+║         Yudhystirady SMC CRYPTO SIGNAL BOT — Clean Modular Edition       ║
+║                                                                          ║
+║  OBJECTIVE: High-frequency signals without over-filtering                ║
+║                                                                          ║
+║  CORE RULES:                                                             ║
+║  ✅ HTF (H1/H4) Market Structure — BOS/CHoCH — REQUIRED                 ║
+║  ✅ Liquidity Sweep (EQH/EQL + wick rejection) — REQUIRED               ║
+║  ✅ Order Block OR Fair Value Gap — REQUIRED                            ║
+║  ✅ Scoring System (max 100 pts) — fire at ≥ 60                         ║
+║  ✅ RSI: scoring factor ONLY, never blocks trades                       ║
+║  ✅ Macro (BTC + BTC.D): scoring factor ONLY, never blocks              ║
+║  ✅ Session bonus: London / New York                                    ║
+║  ✅ RR ≥ 1.5 required | Grade A ≥ 2.0 | Grade B ≥ 1.5                   ║
+║  ✅ Per-pair cooldown: 30 minutes                                       ║
+║  ✅ JSON output + Telegram alerts                                       ║
+╚══════════════════════════════════════════════════════════════════════════╝
+"""
+
 import ccxt
-import pandas as pd
-import numpy as np
-import requests
+import json
+import os
 import time
+import hashlib
 from datetime import datetime, timezone
 
-# ═══════════════════════════════════════════════════════════════
-# KONFIGURASI
-# ═══════════════════════════════════════════════════════════════
+import pandas as pd
+import requests
 
-TELEGRAM_TOKEN    = "8660926908:AAFA7fVSIgZpk2m1QllOgUnEnfpC9iPGIWM"
-TELEGRAM_CHAT_ID  = "8688554062"
 
-PAIRS             = ["BTC/USDT", "ETH/USDT", "XRP/USDT", "SOL/USDT",
-                     "BNB/USDT", "DOGE/USDT", "ADA/USDT", "MATIC/USDT"]
-VOLUME_MULTIPLIER = 1.5
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 1 — CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
 
-# ── [FIX #13] Mode strategi: sniper / normal / aggressive ──────
-STRATEGY_MODE = "normal"   # pilihan: "sniper" | "normal" | "aggressive"
+TELEGRAM_TOKEN   = "8660926908:AAFA7fVSIgZpk2m1QllOgUnEnfpC9iPGIWM"
+TELEGRAM_CHAT_ID = "8688554062"
 
-STRATEGY_CONFIG = {
-    "sniper":     {"threshold": 75, "min_grade": "B",  "label": "🎯 SNIPER"},
-    "normal":     {"threshold": 55, "min_grade": "C",  "label": "📊 NORMAL"},
-    "aggressive": {"threshold": 35, "min_grade": "C",  "label": "⚡ AGGRESSIVE"},
-}
-
-# ── [FIX #10] RR dinamis per kondisi ──────────────────────────
-RR_CONFIG = {
-    "strong_trend": 3.0,
-    "normal":       2.0,
-    "weak":         1.5,
-}
-
-MODES = [
-    {"label": "SCALPING",  "trend_tf": "1h",  "entry_tf": "15m", "emoji": "⚡"},
-    {"label": "SCALPING",  "trend_tf": "1h",  "entry_tf": "30m", "emoji": "⚡"},
-    {"label": "INTRADAY",  "trend_tf": "4h",  "entry_tf": "1h",  "emoji": "📊"},
+PAIRS = [
+    "BTC/USDT",  "ETH/USDT",   "XRP/USDT",  "SOL/USDT",
+    "BNB/USDT",  "DOGE/USDT",  "ADA/USDT",  "POL/USDT",
+    "TRX/USDT",  "AVAX/USDT",  "LINK/USDT", "SHIB/USDT",
+    "TON/USDT",  "SUI/USDT",   "DOT/USDT",  "LTC/USDT",
+    "BCH/USDT",  "NEAR/USDT",  "APT/USDT",  "UNI/USDT",
+    "ICP/USDT",  "PEPE/USDT",  "ETC/USDT",  "STX/USDT",
+    "FIL/USDT",  "OP/USDT",    "INJ/USDT",  "IMX/USDT",
+    "ARB/USDT",  "ATOM/USDT",  "VET/USDT",  "RENDER/USDT",
+    "GRT/USDT",  "SAND/USDT",  "MANA/USDT", "AAVE/USDT",
+    "THETA/USDT","XLM/USDT",   "ALGO/USDT", "AXS/USDT",
+    "EGLD/USDT", "HBAR/USDT",  "QNT/USDT",  "FLOW/USDT",
+    "CHZ/USDT",  "GALA/USDT",  "KAVA/USDT", "ZIL/USDT",
+    "HYPE/USDT",
 ]
 
-# ═══════════════════════════════════════════════════════════════
-# EXCHANGE — Auto Fallback
-# ═══════════════════════════════════════════════════════════════
+# Scan modes: HTF bias → entry TF
+MODES = [
+    {"label": "SCALPING",  "htf_tf": "4h", "entry_tf": "15m"},
+    {"label": "SCALPING",  "htf_tf": "4h", "entry_tf": "30m"},
+    {"label": "INTRADAY",  "htf_tf": "1d", "entry_tf": "1h"},
+]
 
-def pair_ke_gate(pair):
-    return pair.replace("/", "_")
+# ── Detection Parameters ────────────────────────────────────────────────────
+SWING_WINDOW         = 5       # Pivot lookback window
+SWEEP_LOOKBACK       = 30      # Candles back for sweep detection
+OB_LOOKBACK          = 40      # Candles back for OB search
+FVG_LOOKBACK         = 40      # Candles back for FVG search
+EQH_EQL_TOLERANCE    = 0.0015  # Equal highs/lows tolerance (0.15%)
+WICK_BODY_RATIO_MIN  = 1.5     # Min wick-to-body for valid sweep rejection
+REJECTION_TOLERANCE  = 0.003   # 0.3% close tolerance after sweep
+OB_MITIGATION_LIMIT  = 2       # Max taps before OB is mitigated
+MIN_DISPLACEMENT_PCT = 0.25    # Min body % for valid OB impulse
+MIN_FVG_PCT          = 0.08    # Min gap size % for valid FVG
+ATR_PERIOD           = 14
+
+# ── Scoring Weights (total max = 100 pts) ───────────────────────────────────
+# +20 HTF trend aligned
+# +20 Liquidity sweep
+# +15 Valid OB or FVG
+# +10 Strong displacement
+# +5  Volume spike
+# +5  Session (London/NY)
+# +5  RSI 50–65 (scoring only)
+# +10 Macro aligned (BTC + BTC.D, scoring only)
+# −5  RSI extreme (>75 or <25)
+# −5  Macro conflict
+SCORE_HTF_ALIGNED    = 20
+SCORE_LIQUIDITY      = 20
+SCORE_OB_FVG         = 15
+SCORE_DISPLACEMENT   = 10
+SCORE_VOLUME         = 5
+SCORE_SESSION        = 5
+SCORE_RSI_IDEAL      = 5
+SCORE_MACRO_ALIGNED  = 10
+SCORE_RSI_PENALTY    = -5      # RSI > 75 or < 25
+SCORE_MACRO_CONFLICT = -5
+
+MIN_SCORE            = 60      # Minimum score to fire signal
+COOLDOWN_MINUTES     = 30      # Per-pair cooldown in minutes
+SCAN_INTERVAL        = 900     # Seconds between full scans (15 min)
+LOG_FILE             = "signals_smc.json"
+
+# RR thresholds
+RR_GRADE_A   = 2.0
+RR_GRADE_B   = 1.5             # Minimum to take trade
+
+# Macro config
+ALTCOIN_EXEMPTIONS   = {"BTC/USDT", "ETH/USDT"}
+BTC_BIAS_TF          = "1d"
+BTCD_SMA_PERIOD      = 20
+RSI_PERIOD           = 14
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 2 — EXCHANGE LAYER
+# ═══════════════════════════════════════════════════════════════════════════
 
 KUCOIN_MAP = {
-    "BTC/USDT":   "XBTUSDTM",
-    "ETH/USDT":   "ETHUSDTM",
-    "XRP/USDT":   "XRPUSDTM",
-    "SOL/USDT":   "SOLUSDTM",
-    "BNB/USDT":   "BNBUSDTM",
-    "DOGE/USDT":  "DOGEUSDTM",
-    "ADA/USDT":   "ADAUSDTM",
-    "MATIC/USDT": "MATICUSDTM",
+    "BTC/USDT":"XBTUSDTM","ETH/USDT":"ETHUSDTM","XRP/USDT":"XRPUSDTM",
+    "SOL/USDT":"SOLUSDTM","BNB/USDT":"BNBUSDTM","DOGE/USDT":"DOGEUSDTM",
+    "ADA/USDT":"ADAUSDTM","POL/USDT":"POLUSDTM","TRX/USDT":"TRXUSDTM",
+    "AVAX/USDT":"AVAXUSDTM","LINK/USDT":"LINKUSDTM","SHIB/USDT":"SHIBUSDTM",
+    "TON/USDT":"TONUSDTM","SUI/USDT":"SUIUSDTM","DOT/USDT":"DOTUSDTM",
+    "LTC/USDT":"LTCUSDTM","BCH/USDT":"BCHUSDTM","NEAR/USDT":"NEARUSDTM",
+    "APT/USDT":"APTUSDTM","UNI/USDT":"UNIUSDTM","ICP/USDT":"ICPUSDTM",
+    "PEPE/USDT":"PEPEUSDTM","ETC/USDT":"ETCUSDTM","STX/USDT":"STXUSDTM",
+    "FIL/USDT":"FILUSDTM","OP/USDT":"OPUSDTM","INJ/USDT":"INJUSDTM",
+    "IMX/USDT":"IMXUSDTM","ARB/USDT":"ARBUSDTM","ATOM/USDT":"ATOMUSDTM",
+    "VET/USDT":"VETUSDTM","RENDER/USDT":"RENDERUSDTM","GRT/USDT":"GRTUSDTM",
+    "SAND/USDT":"SANDUSDTM","MANA/USDT":"MANAUSDTM","AAVE/USDT":"AAVEUSDTM",
+    "THETA/USDT":"THETAUSDTM","XLM/USDT":"XLMUSDTM","ALGO/USDT":"ALGOUSDTM",
+    "AXS/USDT":"AXSUSDTM","EGLD/USDT":"EGLDUSDTM","HBAR/USDT":"HBARUSDTM",
+    "QNT/USDT":"QNTUSDTM","FLOW/USDT":"FLOWUSDTM","CHZ/USDT":"CHZUSDTM",
+    "GALA/USDT":"GALAUSDTM","KAVA/USDT":"KAVAUSDTM","ZIL/USDT":"ZILUSDTM",
+    "HYPE/USDT":"HYPEUSDTM",
 }
 
 EXCHANGES = {
     "Gate.io": ccxt.gateio({
-        "enableRateLimit": True,
-        "timeout": 15000,
+        "enableRateLimit": True, "timeout": 15000,
         "options": {"defaultType": "future"},
     }),
     "MEXC": ccxt.mexc({
-        "enableRateLimit": True,
-        "timeout": 15000,
+        "enableRateLimit": True, "timeout": 15000,
         "options": {"defaultType": "swap"},
     }),
     "KuCoin Futures": ccxt.kucoinfutures({
-        "enableRateLimit": True,
-        "timeout": 15000,
+        "enableRateLimit": True, "timeout": 15000,
     }),
 }
 
-EXCHANGE_ORDER = ["Gate.io", "MEXC", "KuCoin Futures"]
-aktif_exchange  = "Gate.io"
+EXCHANGE_ORDER  = ["Gate.io", "MEXC", "KuCoin Futures"]
+_aktif_exchange = "Gate.io"
 
-def konversi_pair(nama_exchange, pair):
-    if nama_exchange == "Gate.io":
-        return pair_ke_gate(pair)
-    elif nama_exchange == "KuCoin Futures":
-        return KUCOIN_MAP.get(pair, pair)
+
+def _convert_symbol(exchange_name: str, pair: str) -> str:
+    if exchange_name == "Gate.io":
+        return pair.replace("/", "_")
+    if exchange_name == "KuCoin Futures":
+        return KUCOIN_MAP.get(pair, pair.replace("/USDT", "USDTM"))
     return pair
 
-def ambil_data(pair, timeframe, limit=150):
-    global aktif_exchange
-    urutan = [aktif_exchange] + [e for e in EXCHANGE_ORDER if e != aktif_exchange]
-    for nama in urutan:
+
+def fetch_ohlcv(pair: str, timeframe: str, limit: int = 200) -> pd.DataFrame:
+    """Fetch OHLCV with automatic exchange fallback. Returns DataFrame."""
+    global _aktif_exchange
+    order = [_aktif_exchange] + [e for e in EXCHANGE_ORDER if e != _aktif_exchange]
+
+    for name in order:
         try:
-            ex = EXCHANGES[nama]
-            p  = konversi_pair(nama, pair)
-            candles = ex.fetch_ohlcv(p, timeframe=timeframe, limit=limit)
-            if not candles:
-                raise ValueError("Data kosong")
-            df = pd.DataFrame(candles, columns=['time','open','high','low','close','volume'])
-            df['time'] = pd.to_datetime(df['time'], unit='ms')
-            if aktif_exchange != nama:
-                print(f"  🔄 Pindah ke {nama}")
-                aktif_exchange = nama
-            return df, nama
-        except ccxt.NetworkError as e:
-            print(f"  ⚠️  {nama} network error: {type(e).__name__}")
+            symbol  = _convert_symbol(name, pair)
+            candles = EXCHANGES[name].fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            if not candles or len(candles) < 50:
+                raise ValueError(f"Only {len(candles) if candles else 0} candles")
+            df = pd.DataFrame(candles, columns=["time","open","high","low","close","volume"])
+            df["time"] = pd.to_datetime(df["time"], unit="ms")
+            if _aktif_exchange != name:
+                print(f"  🔄 Switched → {name}")
+                _aktif_exchange = name
+            return df
+        except ccxt.NetworkError:
+            print(f"  ⚠️  {name} network error")
         except ccxt.ExchangeError as e:
-            print(f"  ⚠️  {nama} exchange error: {e}")
+            print(f"  ⚠️  {name} exchange error: {e}")
         except Exception as e:
-            print(f"  ⚠️  {nama} gagal: {e}")
-    raise RuntimeError(f"Semua exchange gagal untuk {pair} {timeframe}")
+            print(f"  ⚠️  {name} failed: {e}")
 
-# ═══════════════════════════════════════════════════════════════
-# [FIX #9] SESSION AWARENESS
-# ═══════════════════════════════════════════════════════════════
+    raise RuntimeError(f"All exchanges failed for {pair} @ {timeframe}")
 
-def deteksi_session():
-    """Deteksi sesi trading berdasarkan UTC. Return (nama_sesi, multiplier_bobot)."""
-    jam_utc = datetime.now(timezone.utc).hour
-    if 0 <= jam_utc < 8:
-        return "Asia", 0.8
-    elif 7 <= jam_utc < 13:
-        return "London", 1.2
-    elif 12 <= jam_utc < 21:
-        return "New York", 1.1
-    else:
-        return "Overlap/Dead", 0.7
 
-# ═══════════════════════════════════════════════════════════════
-# [FIX #8] MARKET REGIME DETECTION
-# ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 3 — MARKET STRUCTURE (BOS / CHoCH)
+# ═══════════════════════════════════════════════════════════════════════════
 
-def deteksi_market_regime(df, lookback=30):
-    """
-    Return: dict dengan keys:
-      regime   → 'TRENDING' | 'RANGING' | 'HIGH_VOL' | 'LOW_VOL'
-      atr      → float (ATR nilai)
-      atr_pct  → float (ATR sebagai % harga)
-    """
-    recent = df.iloc[-lookback:]
-    atr    = (recent['high'] - recent['low']).mean()
-    harga  = df['close'].iloc[-1]
-    atr_pct = atr / harga * 100
-
-    # Volatility threshold
-    vol_harga = recent['close'].pct_change().std() * 100
-    high_vol  = vol_harga > 2.0
-    low_vol   = vol_harga < 0.5
-
-    # ADX proxy (range of close / range of high-low)
-    close_range = recent['close'].max() - recent['close'].min()
-    hl_range    = recent['high'].max() - recent['low'].min()
-    directional = close_range / hl_range if hl_range > 0 else 0
-
-    if high_vol:
-        regime = "HIGH_VOL"
-    elif low_vol:
-        regime = "LOW_VOL"
-    elif directional > 0.55:
-        regime = "TRENDING"
-    else:
-        regime = "RANGING"
-
-    return {"regime": regime, "atr": atr, "atr_pct": atr_pct, "directional": directional}
-
-# ═══════════════════════════════════════════════════════════════
-# [FIX #2] MARKET STRUCTURE — CORE HIERARCHY
-# ═══════════════════════════════════════════════════════════════
-
-def deteksi_struktur(df):
-    """
-    Deteksi trend + BOS/CHoCH. Return (trend, event, strength_score).
-    strength_score 0–100 menunjukkan kekuatan struktur.
-    """
+def find_swings(df: pd.DataFrame, window: int = SWING_WINDOW) -> tuple:
+    """Return (highs, lows) as lists of (index, price)."""
     highs, lows = [], []
-    window = 5
     for i in range(window, len(df) - window):
-        if df['high'].iloc[i] == df['high'].iloc[i-window:i+window].max():
-            highs.append((i, df['high'].iloc[i]))
-        if df['low'].iloc[i] == df['low'].iloc[i-window:i+window].min():
-            lows.append((i, df['low'].iloc[i]))
+        hi_window = df["high"].iloc[i - window: i + window + 1]
+        lo_window = df["low"].iloc[i - window: i + window + 1]
+        if df["high"].iloc[i] == hi_window.max():
+            highs.append((i, float(df["high"].iloc[i])))
+        if df["low"].iloc[i] == lo_window.min():
+            lows.append((i, float(df["low"].iloc[i])))
+    return highs, lows
 
+
+def detect_structure(df: pd.DataFrame) -> tuple:
+    """
+    Detect trend + structural event using swing highs/lows.
+    Returns: (trend, event, last_swing_high, last_swing_low)
+      trend: 'BULLISH' | 'BEARISH' | 'RANGING'
+      event: 'BOS' | 'CHoCH' | None
+    """
+    highs, lows = find_swings(df)
     if len(highs) < 2 or len(lows) < 2:
-        return 'RANGING', None, 0
+        return "RANGING", None, None, None
 
-    last_hh, prev_hh = highs[-1][1], highs[-2][1]
-    last_ll, prev_ll = lows[-1][1],  lows[-2][1]
-    harga = df['close'].iloc[-1]
+    last_sh, prev_sh = highs[-1][1], highs[-2][1]
+    last_sl, prev_sl = lows[-1][1],  lows[-2][1]
 
-    bullish = last_hh > prev_hh and last_ll > prev_ll
-    bearish = last_hh < prev_hh and last_ll < prev_ll
+    hh = last_sh > prev_sh
+    hl = last_sl > prev_sl
+    lh = last_sh < prev_sh
+    ll = last_sl < prev_sl
 
-    # [FIX #11] Kekuatan struktur: displacement + konsistensi
-    strength = 0
-    if bullish or bearish:
-        # Seberapa signifikan break-nya
-        if bullish:
-            break_pct = (last_hh - prev_hh) / prev_hh * 100
+    if hh and hl:
+        trend = "BULLISH"
+        event = "BOS" if hh else "CHoCH"
+    elif lh and ll:
+        trend = "BEARISH"
+        event = "BOS" if ll else "CHoCH"
+    elif (hh and ll) or (lh and hl):
+        trend  = "RANGING"
+        # Detect CHoCH: bullish structure broken to downside or vice versa
+        event  = "CHoCH" if (hh and ll) or (lh and hl) else None
+    else:
+        trend = "RANGING"
+        event = None
+
+    return trend, event, last_sh, last_sl
+
+
+def get_htf_bias(df_htf: pd.DataFrame) -> tuple:
+    """
+    HTF mandatory gate.
+    Returns: (bias, event, sh, sl)
+    """
+    return detect_structure(df_htf)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 4 — LIQUIDITY SWEEP
+# ═══════════════════════════════════════════════════════════════════════════
+
+def detect_eqh_eql(df: pd.DataFrame) -> dict:
+    """Detect Equal Highs / Equal Lows clusters within SWEEP_LOOKBACK candles."""
+    recent = df.iloc[-SWEEP_LOOKBACK:]
+    h_vals = recent["high"].values
+    l_vals = recent["low"].values
+
+    eqh_pool, eql_pool = [], []
+    for i in range(len(h_vals)):
+        for j in range(i + 1, len(h_vals)):
+            if abs(h_vals[i] - h_vals[j]) / (h_vals[i] + 1e-9) <= EQH_EQL_TOLERANCE:
+                eqh_pool.append(max(h_vals[i], h_vals[j]))
+    for i in range(len(l_vals)):
+        for j in range(i + 1, len(l_vals)):
+            if abs(l_vals[i] - l_vals[j]) / (l_vals[i] + 1e-9) <= EQH_EQL_TOLERANCE:
+                eql_pool.append(min(l_vals[i], l_vals[j]))
+
+    return {
+        "eqh": float(max(eqh_pool)) if eqh_pool else None,
+        "eql": float(min(eql_pool)) if eql_pool else None,
+    }
+
+
+def detect_liquidity_sweep(df: pd.DataFrame, trend: str) -> tuple:
+    """
+    Detect liquidity sweep: price sweeps swing H/L or EQH/EQL and rejects.
+    Rejection valid when wick > body (wick-body ratio ≥ WICK_BODY_RATIO_MIN).
+
+    Returns: (swept: bool, sweep_type: str, level: float)
+    """
+    recent     = df.iloc[-SWEEP_LOOKBACK:]
+    c          = df.iloc[-1]
+    c_prev     = df.iloc[-2]
+    eq         = detect_eqh_eql(df)
+    swing_high = float(recent["high"].max())
+    swing_low  = float(recent["low"].min())
+
+    def wick_body_ok(candle, direction: str) -> bool:
+        """Check wick-to-body ratio for rejection confirmation."""
+        o, h, l, cl = (float(candle[x]) for x in ["open","high","low","close"])
+        body = abs(cl - o)
+        if body < 1e-9:
+            return False
+        if direction == "BULLISH":
+            lower_wick = (min(o, cl) - l)
+            return (lower_wick / body) >= WICK_BODY_RATIO_MIN
         else:
-            break_pct = (prev_ll - last_ll) / prev_ll * 100
-        strength = min(100, int(break_pct * 20))  # skala kasar
+            upper_wick = (h - max(o, cl))
+            return (upper_wick / body) >= WICK_BODY_RATIO_MIN
 
-    if bullish:
-        event = 'CHoCH' if harga > prev_hh else 'BOS'
-        return 'BULLISH', event, strength
-    elif bearish:
-        event = 'CHoCH' if harga < prev_ll else 'BOS'
-        return 'BEARISH', event, strength
+    if trend == "BULLISH":
+        eql = eq.get("eql")
+        # Check swing low sweep with rejection
+        for candle in [c_prev, c]:
+            swept_level = None
+            if float(candle["low"]) < swing_low:
+                swept_level = swing_low
+            elif eql and float(candle["low"]) < eql:
+                swept_level = eql
 
-    return 'RANGING', None, 0
+            if swept_level is not None:
+                close_rejected = float(candle["close"]) > swept_level * (1 - REJECTION_TOLERANCE)
+                if close_rejected and wick_body_ok(candle, "BULLISH"):
+                    return True, "Bullish Sweep + Rejection", swept_level
+                elif close_rejected:
+                    return True, "Bullish Sweep (weak)", swept_level
 
-# ═══════════════════════════════════════════════════════════════
-# [FIX #3] FLEXIBLE LIQUIDITY MODEL
-# ═══════════════════════════════════════════════════════════════
+    elif trend == "BEARISH":
+        eqh = eq.get("eqh")
+        for candle in [c_prev, c]:
+            swept_level = None
+            if float(candle["high"]) > swing_high:
+                swept_level = swing_high
+            elif eqh and float(candle["high"]) > eqh:
+                swept_level = eqh
 
-def deteksi_liquidity(df, trend, lookback=30):
+            if swept_level is not None:
+                close_rejected = float(candle["close"]) < swept_level * (1 + REJECTION_TOLERANCE)
+                if close_rejected and wick_body_ok(candle, "BEARISH"):
+                    return True, "Bearish Sweep + Rejection", swept_level
+                elif close_rejected:
+                    return True, "Bearish Sweep (weak)", swept_level
+
+    return False, None, None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 5 — ORDER BLOCK
+# ═══════════════════════════════════════════════════════════════════════════
+
+def find_order_blocks(df: pd.DataFrame, trend: str) -> list:
     """
-    Return dict dengan:
-      external_sweep   → bool (swing H/L tersentuh)
-      internal_sweep   → bool (minor H/L tersentuh)
-      inducement       → bool (fake move sebelum reversal)
-      score            → 0–30 (bobot total likuiditas)
-    """
-    recent = df.iloc[-lookback:]
-    c = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    result = {"external_sweep": False, "internal_sweep": False, "inducement": False, "score": 0}
-
-    if trend == 'BULLISH':
-        swing_low    = recent['low'].min()
-        minor_lows   = recent['low'].nsmallest(3).values
-
-        # External sweep
-        if c['low'] <= swing_low * 1.002 and c['close'] > swing_low:
-            result["external_sweep"] = True
-            result["score"] += 20
-
-        # Internal sweep (minor low)
-        for ml in minor_lows[1:]:
-            if c['low'] <= ml * 1.002 and c['close'] > ml:
-                result["internal_sweep"] = True
-                result["score"] += 10
-                break
-
-        # Inducement: candle sebelumnya tembus low lalu close di atas
-        if prev['low'] < recent['low'].quantile(0.2) and c['close'] > prev['close']:
-            result["inducement"] = True
-            result["score"] += 10
-
-    elif trend == 'BEARISH':
-        swing_high   = recent['high'].max()
-        minor_highs  = recent['high'].nlargest(3).values
-
-        # External sweep
-        if c['high'] >= swing_high * 0.998 and c['close'] < swing_high:
-            result["external_sweep"] = True
-            result["score"] += 20
-
-        # Internal sweep
-        for mh in minor_highs[1:]:
-            if c['high'] >= mh * 0.998 and c['close'] < mh:
-                result["internal_sweep"] = True
-                result["score"] += 10
-                break
-
-        # Inducement
-        if prev['high'] > recent['high'].quantile(0.8) and c['close'] < prev['close']:
-            result["inducement"] = True
-            result["score"] += 10
-
-    return result
-
-# ═══════════════════════════════════════════════════════════════
-# [FIX #4] DYNAMIC ORDER BLOCK ZONE
-# ═══════════════════════════════════════════════════════════════
-
-def cari_order_block(df, trend):
-    """
-    Return list OB zone (dicts). Tidak harus impuls besar,
-    multi-candle zone, boleh overlap.
+    Detect unmitigated institutional Order Blocks.
+    OB = opposing candle immediately before a strong displacement impulse.
+    Returns top-3 OBs sorted by strength.
     """
     ob_list = []
-    for i in range(max(0, len(df) - 20), len(df) - 1):
-        c, n = df.iloc[i], df.iloc[i + 1]
-        move = (n['close'] - n['open']) / n['open']
+    start   = max(1, len(df) - OB_LOOKBACK)
+    price   = float(df["close"].iloc[-1])
 
-        if trend == 'BULLISH' and c['close'] < c['open']:
-            # Tidak wajib threshold besar — deteksi bearish candle sebelum bullish move
-            strength = abs(move) * 100
-            ob_list.append({
-                "low": c['low'], "high": c['high'],
-                "mid": (c['low'] + c['high']) / 2,
-                "strength": min(strength * 10, 30),
-                "index": i
-            })
+    for i in range(start, len(df) - 2):
+        c   = df.iloc[i]
+        nxt = df.iloc[i + 1]
+        impulse_pct = abs(float(nxt["close"]) - float(nxt["open"])) / (float(nxt["open"]) + 1e-9) * 100
 
-        elif trend == 'BEARISH' and c['close'] > c['open']:
-            strength = abs(move) * 100
-            ob_list.append({
-                "low": c['low'], "high": c['high'],
-                "mid": (c['low'] + c['high']) / 2,
-                "strength": min(strength * 10, 30),
-                "index": i
-            })
+        if impulse_pct < MIN_DISPLACEMENT_PCT:
+            continue
 
-    return ob_list
+        is_valid = False
+        if trend == "BULLISH" and float(c["close"]) < float(c["open"]) and float(nxt["close"]) > float(nxt["open"]):
+            is_valid = True
+        elif trend == "BEARISH" and float(c["close"]) > float(c["open"]) and float(nxt["close"]) < float(nxt["open"]):
+            is_valid = True
 
-def harga_di_order_block(harga, ob_list, toleransi=0.002):
-    """Return (bool, best_ob_or_None)."""
+        if not is_valid:
+            continue
+
+        ob = {
+            "low":      float(c["low"]),
+            "high":     float(c["high"]),
+            "mid":      float((float(c["low"]) + float(c["high"])) / 2),
+            "index":    i,
+            "impulse":  impulse_pct,
+        }
+
+        # Count taps (mitigation check)
+        taps = sum(
+            1 for j in range(i + 2, len(df))
+            if float(df.iloc[j]["low"]) <= ob["high"] and float(df.iloc[j]["high"]) >= ob["low"]
+        )
+        if taps >= OB_MITIGATION_LIMIT:
+            continue
+
+        ob["taps"]     = taps
+        dist_pct       = abs(price - ob["mid"]) / (price + 1e-9) * 100
+        ob["strength"] = impulse_pct / (1.0 + dist_pct) / (1.0 + taps)
+        ob_list.append(ob)
+
+    ob_list.sort(key=lambda x: x["strength"], reverse=True)
+    return ob_list[:3]
+
+
+def price_in_ob(price: float, ob_list: list, tolerance: float = 0.004) -> tuple:
+    """Returns (in_ob: bool, best_ob: dict|None)."""
     if not ob_list:
         return False, None
-    harga_adj_lo = harga * (1 - toleransi)
-    harga_adj_hi = harga * (1 + toleransi)
-    hits = [ob for ob in ob_list if ob['low'] <= harga_adj_hi and ob['high'] >= harga_adj_lo]
-    if not hits:
-        return False, None
-    best = max(hits, key=lambda x: x['strength'])
-    return True, best
+    lo   = price * (1 - tolerance)
+    hi   = price * (1 + tolerance)
+    hits = [ob for ob in ob_list if ob["low"] <= hi and ob["high"] >= lo]
+    return (True, max(hits, key=lambda x: x["strength"])) if hits else (False, None)
 
-# ═══════════════════════════════════════════════════════════════
-# [FIX #5] IMPERFECT IMBALANCE / FVG
-# ═══════════════════════════════════════════════════════════════
 
-def cari_fvg(df, trend, toleransi=0.003):
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 6 — FAIR VALUE GAP (FVG)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def find_fvg(df: pd.DataFrame, trend: str) -> dict | None:
     """
-    Deteksi FVG + partial imbalance.
-    toleransi: izinkan gap kecil / partial.
+    Find the most recent valid, unfilled (or partially filled) FVG.
+    Returns the best FVG dict or None.
     """
+    start    = max(1, len(df) - FVG_LOOKBACK)
+    price    = float(df["close"].iloc[-1])
     fvg_list = []
-    for i in range(1, len(df) - 1):
-        prev_c, nxt_c = df.iloc[i-1], df.iloc[i+1]
 
-        if trend == 'BULLISH':
-            gap = nxt_c['low'] - prev_c['high']
-            if gap > -prev_c['high'] * toleransi:   # partial/imperfect juga valid
-                top    = nxt_c['low']
-                bottom = prev_c['high']
-                if top < bottom:                     # swap jika partial overlap
-                    top, bottom = bottom, top
-                fvg_list.append({
-                    'type': 'BULLISH_FVG', 'top': top, 'bottom': bottom,
-                    'gap_pct': gap / prev_c['high'] * 100, 'index': i
-                })
+    for i in range(start, len(df) - 1):
+        p1 = df.iloc[i - 1]
+        p3 = df.iloc[i + 1]
 
-        elif trend == 'BEARISH':
-            gap = prev_c['low'] - nxt_c['high']
-            if gap > -prev_c['low'] * toleransi:
-                top    = prev_c['low']
-                bottom = nxt_c['high']
-                if top < bottom:
-                    top, bottom = bottom, top
-                fvg_list.append({
-                    'type': 'BEARISH_FVG', 'top': top, 'bottom': bottom,
-                    'gap_pct': gap / prev_c['low'] * 100, 'index': i
-                })
+        if trend == "BULLISH":
+            gap     = float(p3["low"]) - float(p1["high"])
+            min_gap = float(p1["high"]) * MIN_FVG_PCT / 100
+            if gap < min_gap:
+                continue
+            fvg_top, fvg_bot = float(p3["low"]), float(p1["high"])
 
-    harga = df['close'].iloc[-1]
-    fvg_aktif = [f for f in fvg_list if
-                 (f['type'] == 'BULLISH_FVG' and harga > f['bottom']) or
-                 (f['type'] == 'BEARISH_FVG' and harga < f['top'])]
-    if not fvg_aktif:
-        return None
-    fvg_aktif.sort(key=lambda x: abs(harga - (x['top'] + x['bottom']) / 2))
-    return fvg_aktif[0]
-
-def harga_di_fvg(harga, fvg, toleransi=0.004):
-    if fvg is None:
-        return False
-    return fvg['bottom'] * (1 - toleransi) <= harga <= fvg['top'] * (1 + toleransi)
-
-# ═══════════════════════════════════════════════════════════════
-# [FIX #6] CONTEXTUAL PD ZONE
-# ═══════════════════════════════════════════════════════════════
-
-def hitung_pd_zone(df, lookback=50):
-    """Return (premium_batas, discount_batas, mid, posisi_harga)."""
-    recent  = df.iloc[-lookback:]
-    high_eq = recent['high'].max()
-    low_eq  = recent['low'].min()
-    mid     = (high_eq + low_eq) / 2
-    harga   = df['close'].iloc[-1]
-
-    premium_batas  = mid + (high_eq - mid) * 0.382   # zona premium mulai
-    discount_batas = mid - (mid - low_eq) * 0.382    # zona discount mulai
-
-    if harga > premium_batas:
-        posisi = "PREMIUM"
-    elif harga < discount_batas:
-        posisi = "DISCOUNT"
-    else:
-        posisi = "EQUILIBRIUM"
-
-    return premium_batas, discount_batas, mid, posisi
-
-def cek_pd_valid(trend, posisi_pd, regime):
-    """
-    [FIX #6]: PD wajib hanya saat ranging, opsional saat trending.
-    Return (valid: bool, bobot: int)
-    """
-    if trend == 'BULLISH' and posisi_pd == 'DISCOUNT':
-        return True, 15
-    if trend == 'BEARISH' and posisi_pd == 'PREMIUM':
-        return True, 15
-    if regime == "TRENDING":
-        # Saat trending kuat, PD tidak wajib — beri bobot partial
-        return True, 5
-    if regime == "RANGING":
-        # Saat ranging, PD menjadi filter wajib
-        return False, 0
-    # Default: partial
-    return True, 5
-
-# ═══════════════════════════════════════════════════════════════
-# [FIX #11] MOMENTUM STRENGTH
-# ═══════════════════════════════════════════════════════════════
-
-def hitung_momentum(df, lookback=5):
-    """
-    Return dict:
-      displacement    → rata-rata body candle terakhir
-      speed           → pct change rata-rata
-      consistency     → berapa candle searah trend dari lookback
-      score           → 0–20
-    """
-    recent = df.iloc[-lookback:]
-    bodies = abs(recent['close'] - recent['open'])
-    displacement = bodies.mean() / df['close'].iloc[-1] * 100
-
-    pct_changes = recent['close'].pct_change().dropna()
-    speed = abs(pct_changes).mean() * 100
-
-    direction = 1 if df['close'].iloc[-1] > df['close'].iloc[-lookback] else -1
-    consistent_candles = sum(
-        1 for i in range(len(pct_changes))
-        if (pct_changes.iloc[i] > 0 and direction == 1) or (pct_changes.iloc[i] < 0 and direction == -1)
-    )
-    consistency = consistent_candles / len(pct_changes) if len(pct_changes) > 0 else 0
-
-    score = 0
-    if displacement > 0.3:
-        score += 8
-    elif displacement > 0.1:
-        score += 4
-    if consistency > 0.7:
-        score += 7
-    elif consistency > 0.5:
-        score += 4
-    if speed > 0.2:
-        score += 5
-
-    return {
-        "displacement": displacement,
-        "speed": speed,
-        "consistency": consistency,
-        "score": min(score, 20)
-    }
-
-# ═══════════════════════════════════════════════════════════════
-# [FIX #14] PRICE BEHAVIOR AWARENESS
-# ═══════════════════════════════════════════════════════════════
-
-def deteksi_price_behavior(df):
-    """
-    Return dict:
-      rejection        → bool (panjang wick vs body)
-      consolidation    → bool (candle kecil sebelum potensi move)
-      breakout_strength → float
-      score            → 0–15
-    """
-    c = df.iloc[-1]
-    p = df.iloc[-2]
-    pp = df.iloc[-3]
-
-    body  = abs(c['close'] - c['open'])
-    wick_up   = c['high'] - max(c['open'], c['close'])
-    wick_down = min(c['open'], c['close']) - c['low']
-    total_range = c['high'] - c['low'] if c['high'] != c['low'] else 0.0001
-
-    # Rejection: wick panjang relatif terhadap body
-    rejection = (wick_up + wick_down) > body * 1.5
-
-    # Consolidation: 2-3 candle kecil sebelum candle terakhir
-    bodies_prev = [abs(p['close'] - p['open']), abs(pp['close'] - pp['open'])]
-    avg_range   = (df['high'] - df['low']).iloc[-20:].mean()
-    consolidation = all(b < avg_range * 0.5 for b in bodies_prev)
-
-    # Breakout strength
-    breakout_strength = body / total_range
-
-    score = 0
-    if rejection:
-        score += 7
-    if consolidation:
-        score += 5
-    if breakout_strength > 0.6:
-        score += 3
-
-    return {
-        "rejection": rejection,
-        "consolidation": consolidation,
-        "breakout_strength": breakout_strength,
-        "score": score
-    }
-
-# ═══════════════════════════════════════════════════════════════
-# VOLUME KONFIRMASI
-# ═══════════════════════════════════════════════════════════════
-
-def volume_konfirmasi(df, lookback=20):
-    avg = df['volume'].iloc[-lookback:-1].mean()
-    vol = df['volume'].iloc[-1]
-    ratio = vol / avg if avg > 0 else 0
-    ok = ratio >= VOLUME_MULTIPLIER
-    score = 0
-    if ratio >= 2.0:
-        score = 10
-    elif ratio >= 1.5:
-        score = 7
-    elif ratio >= 1.0:
-        score = 3
-    return ok, vol, avg, ratio, score
-
-# ═══════════════════════════════════════════════════════════════
-# [FIX #7] MULTI ENTRY MODEL
-# ═══════════════════════════════════════════════════════════════
-
-def deteksi_tipe_entry(harga, ob_list, fvg, trend, df):
-    """
-    Return (tipe_entry: str, desc: str)
-    Tipe: 'RETEST' | 'BREAKOUT' | 'CONTINUATION'
-    """
-    di_ob, best_ob = harga_di_order_block(harga, ob_list)
-    di_fvg_zona    = harga_di_fvg(harga, fvg)
-
-    # Retest entry (harga kembali ke zona OB/FVG)
-    if di_ob or di_fvg_zona:
-        return "RETEST", "Harga retesting OB/FVG zone"
-
-    # Breakout entry (harga baru saja menembus struktur)
-    c    = df.iloc[-1]
-    prev = df.iloc[-2]
-    if trend == 'BULLISH' and c['close'] > prev['high'] and c['close'] > c['open']:
-        return "BREAKOUT", "Bullish breakout konfirmasi"
-    if trend == 'BEARISH' and c['close'] < prev['low'] and c['close'] < c['open']:
-        return "BREAKOUT", "Bearish breakout konfirmasi"
-
-    # Continuation entry (trending tanpa retest)
-    return "CONTINUATION", "Continuation dalam trend kuat"
-
-# ═══════════════════════════════════════════════════════════════
-# [FIX #1 & #12] PROBABILISTIC SCORING SYSTEM + ADAPTIVE FILTER
-# ═══════════════════════════════════════════════════════════════
-
-def hitung_skor(
-    trend_sinkron, struktur_strength,
-    liq_data, ob_di_zona, fvg_di_zona,
-    vol_score, pd_bobot, momentum_score,
-    price_behavior_score, session_multiplier,
-    regime
-):
-    """
-    Return total_skor (0–100+), breakdown (dict)
-
-    HIERARCHY [FIX #2]:
-      Core      (max 35): market structure
-      Secondary (max 30): liquidity
-      Entry     (max 20): OB / FVG
-      Confirm   (max 15): volume + price behavior
-    """
-    breakdown = {}
-
-    # ── CORE: Market Structure ────────────────────────────────
-    core = 0
-    if trend_sinkron:
-        core += 20
-    core += min(struktur_strength, 15)   # kekuatan BOS/CHoCH
-    breakdown['core_structure'] = core
-
-    # ── SECONDARY: Liquidity ─────────────────────────────────
-    liq_score = min(liq_data['score'], 30)
-    breakdown['liquidity'] = liq_score
-
-    # ── ENTRY: OB / FVG ──────────────────────────────────────
-    entry = 0
-    if ob_di_zona:
-        entry += 12
-    if fvg_di_zona:
-        entry += 8
-    breakdown['entry_zone'] = entry
-
-    # ── CONFIRMATION: Volume + Price Behavior ────────────────
-    confirm = vol_score + price_behavior_score
-    confirm = min(confirm, 15)
-    breakdown['confirmation'] = confirm
-
-    # ── KONTEKS TAMBAHAN ─────────────────────────────────────
-    konteks = pd_bobot + momentum_score
-    breakdown['context'] = konteks
-
-    total = core + liq_score + entry + confirm + konteks
-
-    # [FIX #9] Session multiplier
-    total_adj = total * session_multiplier
-    breakdown['session_multiplier'] = session_multiplier
-    breakdown['raw_total'] = total
-    breakdown['adjusted_total'] = round(total_adj, 1)
-
-    return round(total_adj, 1), breakdown
-
-# ═══════════════════════════════════════════════════════════════
-# [FIX #15] TRADE GRADING
-# ═══════════════════════════════════════════════════════════════
-
-def grade_sinyal(skor):
-    """Return (grade, emoji)."""
-    if skor >= 80:
-        return "A+", "🏆"
-    elif skor >= 65:
-        return "A",  "🥇"
-    elif skor >= 55:
-        return "B",  "🥈"
-    elif skor >= 40:
-        return "C",  "🥉"
-    else:
-        return "D",  "⚠️"
-
-# ═══════════════════════════════════════════════════════════════
-# [FIX #10] CONTEXTUAL SL/TP
-# ═══════════════════════════════════════════════════════════════
-
-def hitung_sl_tp(trend, entry, ob_list, fvg, kurs_usd, regime, momentum_score, struktur_strength):
-    """
-    SL/TP kontekstual:
-    - strong trend  → RR lebih besar
-    - weak structure → RR lebih konservatif
-    - SL mempertimbangkan ATR/volatility
-    """
-    # Tentukan RR
-    if regime == "TRENDING" and struktur_strength > 50 and momentum_score > 12:
-        rr = RR_CONFIG["strong_trend"]
-        rr_label = "Strong Trend"
-    elif struktur_strength < 20 or regime in ("RANGING", "LOW_VOL"):
-        rr = RR_CONFIG["weak"]
-        rr_label = "Weak Structure"
-    else:
-        rr = RR_CONFIG["normal"]
-        rr_label = "Normal"
-
-    _, best_ob = harga_di_order_block(entry, ob_list)
-
-    if trend == 'BULLISH':
-        kandidat = []
-        if best_ob:
-            kandidat.append(best_ob['low'] * 0.995)
-        if fvg:
-            kandidat.append(fvg['bottom'] * 0.995)
-        sl    = min(kandidat) if kandidat else entry * 0.99
-        jarak = entry - sl
-        tp    = entry + jarak * rr
-    else:
-        kandidat = []
-        if best_ob:
-            kandidat.append(best_ob['high'] * 1.005)
-        if fvg:
-            kandidat.append(fvg['top'] * 1.005)
-        sl    = max(kandidat) if kandidat else entry * 1.01
-        jarak = sl - entry
-        tp    = entry - jarak * rr
-
-    sl_pct = abs(entry - sl) / entry * 100
-    tp_pct = abs(tp - entry) / entry * 100
-
-    return sl, sl * kurs_usd, tp, tp * kurs_usd, sl_pct, tp_pct, rr, rr_label
-
-# ═══════════════════════════════════════════════════════════════
-# UTILITAS
-# ═══════════════════════════════════════════════════════════════
-
-def ambil_kurs_usd():
-    for url in [
-        "https://api.exchangerate-api.com/v4/latest/USD",
-        "https://open.er-api.com/v6/latest/USD",
-    ]:
-        try:
-            r = requests.get(url, timeout=5)
-            return r.json()['rates']['IDR']
-        except:
+        elif trend == "BEARISH":
+            gap     = float(p1["low"]) - float(p3["high"])
+            min_gap = float(p3["high"]) * MIN_FVG_PCT / 100
+            if gap < min_gap:
+                continue
+            fvg_top, fvg_bot = float(p1["low"]), float(p3["high"])
+        else:
             continue
-    print("  ⚠️  Gagal ambil kurs, pakai default 15800")
-    return 15800
 
-def kirim_telegram(pesan):
+        # Fill check: how much of the gap has price revisited?
+        post     = df.iloc[i + 2:]
+        fill_pct = 0.0
+        if len(post) > 0:
+            gap_size = fvg_top - fvg_bot
+            if trend == "BULLISH":
+                deepest = float(post["low"].min())
+                fill_pct = min(1.0, max(0.0, (fvg_top - deepest) / gap_size)) if gap_size > 0 else 0.0
+            else:
+                deepest  = float(post["high"].max())
+                fill_pct = min(1.0, max(0.0, (deepest - fvg_bot) / gap_size)) if gap_size > 0 else 0.0
+
+        if fill_pct >= 0.85:
+            continue  # FVG fully mitigated
+
+        fvg_mid = (fvg_top + fvg_bot) / 2
+        # Check if price is near this FVG
+        in_fvg = fvg_bot * (1 - 0.005) <= price <= fvg_top * (1 + 0.005)
+
+        fvg_list.append({
+            "top":       fvg_top,
+            "bottom":    fvg_bot,
+            "mid":       fvg_mid,
+            "fill_pct":  fill_pct,
+            "index":     i,
+            "in_zone":   in_fvg,
+        })
+
+    if not fvg_list:
+        return None
+
+    # Prefer FVGs that price is currently inside; else pick most recent
+    in_zone = [f for f in fvg_list if f["in_zone"]]
+    return in_zone[-1] if in_zone else fvg_list[-1]
+
+
+def price_in_fvg(price: float, fvg: dict | None) -> bool:
+    """Returns True if price is within the FVG zone (±0.5%)."""
+    if not fvg:
+        return False
+    return fvg["bottom"] * 0.995 <= price <= fvg["top"] * 1.005
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 7 — DISPLACEMENT
+# ═══════════════════════════════════════════════════════════════════════════
+
+def detect_displacement(df: pd.DataFrame, trend: str) -> bool:
+    """
+    Strong displacement = last 1–2 candles show a large body move
+    in the trend direction (body ≥ 2× MIN_DISPLACEMENT_PCT).
+    """
+    threshold = MIN_DISPLACEMENT_PCT * 2
+    for candle in [df.iloc[-1], df.iloc[-2]]:
+        o, cl = float(candle["open"]), float(candle["close"])
+        body_pct = abs(cl - o) / (o + 1e-9) * 100
+        if body_pct >= threshold:
+            if trend == "BULLISH" and cl > o:
+                return True
+            if trend == "BEARISH" and cl < o:
+                return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 8 — VOLUME
+# ═══════════════════════════════════════════════════════════════════════════
+
+def volume_ratio(df: pd.DataFrame, lookback: int = 20) -> float:
+    """Current candle volume vs rolling average."""
+    avg = df["volume"].iloc[-lookback:-1].mean()
+    vol = float(df["volume"].iloc[-1])
+    return round(vol / avg, 2) if avg > 0 else 0.0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 9 — RSI (SCORING ONLY — NEVER BLOCKS TRADES)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def calculate_rsi(df: pd.DataFrame, period: int = RSI_PERIOD) -> float:
+    """Wilder-smoothed RSI. Returns 50.0 on insufficient data."""
+    closes = df["close"].values
+    if len(closes) < period + 1:
+        return 50.0
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains  = [max(d, 0.0) for d in deltas]
+    losses = [abs(min(d, 0.0)) for d in deltas]
+    avg_g  = sum(gains[:period]) / period
+    avg_l  = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_g = (avg_g * (period - 1) + gains[i]) / period
+        avg_l = (avg_l * (period - 1) + losses[i]) / period
+    if avg_l == 0:
+        return 100.0
+    return round(100.0 - (100.0 / (1.0 + avg_g / avg_l)), 2)
+
+
+def rsi_score(rsi: float) -> int:
+    """
+    RSI scoring factor (never blocks trades).
+      +5  RSI 50–65 (ideal momentum)
+      −5  RSI > 75 or < 25 (extreme — penalty)
+    """
+    if 50 <= rsi <= 65:
+        return SCORE_RSI_IDEAL
+    if rsi > 75 or rsi < 25:
+        return SCORE_RSI_PENALTY
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 10 — MACRO (BTC + BTC.D) — SCORING ONLY
+# ═══════════════════════════════════════════════════════════════════════════
+
+_btcd_cache: dict = {"series": None, "ts": 0.0}
+
+
+def fetch_btc_dominance_series() -> list | None:
+    """Fetch 30-day BTC.D series from CoinGecko (cached 15 min)."""
+    global _btcd_cache
+    if _btcd_cache["series"] and (time.time() - _btcd_cache["ts"]) < 900:
+        return _btcd_cache["series"]
+    try:
+        url  = "https://api.coingecko.com/api/v3/global/market_cap_chart?vs_currency=usd&days=30"
+        r    = requests.get(url, timeout=10, headers={"User-Agent": "SMC-Bot"})
+        data = r.json()
+        series = [float(x[1]) for x in data.get("market_cap_percentage", {}).get("btc", [])]
+        if len(series) >= BTCD_SMA_PERIOD * 2:
+            _btcd_cache = {"series": series, "ts": time.time()}
+            return series
+    except Exception:
+        pass
+    return None
+
+
+def get_btcd_trend(series: list | None) -> str:
+    """BTC.D trend via SMA20 slope. Returns 'RISING' | 'FALLING' | 'FLAT'."""
+    if not series or len(series) < BTCD_SMA_PERIOD * 2:
+        return "FLAT"
+    sma_now  = sum(series[-BTCD_SMA_PERIOD:]) / BTCD_SMA_PERIOD
+    sma_prev = sum(series[-BTCD_SMA_PERIOD * 2:-BTCD_SMA_PERIOD]) / BTCD_SMA_PERIOD
+    diff_pct = (sma_now - sma_prev) / (sma_prev + 1e-9) * 100
+    if diff_pct > 0.3:  return "RISING"
+    if diff_pct < -0.3: return "FALLING"
+    return "FLAT"
+
+
+def get_btc_bias() -> str:
+    """Fetch BTC/USDT 1D structural bias."""
+    try:
+        df_btc = fetch_ohlcv("BTC/USDT", BTC_BIAS_TF, limit=200)
+        bias, _, _, _ = detect_structure(df_btc)
+        return bias
+    except Exception:
+        return "RANGING"
+
+
+def macro_score(pair: str, direction: str, btc_bias: str, btcd_trend: str) -> tuple:
+    """
+    Macro scoring (NEVER blocks trades).
+      +10  Aligned: BTC Bull + BTC.D Falling (alt season) for LONG
+               OR  BTC Bear + BTC.D Rising (alt bleed) for SHORT
+      −5   Conflict: macro opposes direction
+       0   Neutral / BTC or ETH pair / insufficient data
+
+    Returns: (score: int, reason: str)
+    """
+    if pair in ALTCOIN_EXEMPTIONS:
+        return 0, "BTC/ETH exempt"
+    if btc_bias == "RANGING" or btcd_trend == "FLAT":
+        return 0, "Macro data insufficient"
+
+    if direction == "BULLISH":
+        if btc_bias == "BULLISH" and btcd_trend == "FALLING":
+            return SCORE_MACRO_ALIGNED, "BTC Bull + BTC.D↓ → Alt season ✅"
+        if btc_bias == "BULLISH" and btcd_trend == "RISING":
+            return SCORE_MACRO_CONFLICT, "BTC Bull + BTC.D↑ → BTC season, alts weak"
+        if btc_bias == "BEARISH" and btcd_trend == "RISING":
+            return SCORE_MACRO_CONFLICT, "BTC Bear + BTC.D↑ → Alts bleeding"
+        return 0, "No strong macro edge"
+
+    if direction == "BEARISH":
+        if btc_bias == "BEARISH" and btcd_trend == "RISING":
+            return SCORE_MACRO_ALIGNED, "BTC Bear + BTC.D↑ → Alt bleed ✅"
+        if btc_bias == "BULLISH" and btcd_trend == "FALLING":
+            return SCORE_MACRO_CONFLICT, "BTC Bull + BTC.D↓ → Alt season, avoid SHORT"
+        if btc_bias == "BEARISH" and btcd_trend == "FALLING":
+            return SCORE_MACRO_CONFLICT, "BTC Bear + BTC.D↓ → Alts may bounce"
+        return 0, "No strong macro edge"
+
+    return 0, "No match"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 11 — SESSION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_session() -> str:
+    """Return current trading session name."""
+    h = datetime.now(timezone.utc).hour
+    if 7  <= h < 13: return "London"
+    if 12 <= h < 21: return "New York"
+    if 0  <= h < 8:  return "Asia"
+    return "Off-Hours"
+
+
+def session_score(session: str) -> int:
+    """London or New York → +5 pts."""
+    return SCORE_SESSION if session in ("London", "New York") else 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 12 — RISK-REWARD CALCULATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def calculate_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> float:
+    """ATR using true range."""
+    trs = []
+    for i in range(1, len(df)):
+        h  = float(df.iloc[i]["high"])
+        l  = float(df.iloc[i]["low"])
+        pc = float(df.iloc[i - 1]["close"])
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if not trs:
+        return float(df["high"].iloc[-1] - df["low"].iloc[-1])
+    return sum(trs[-period:]) / min(period, len(trs))
+
+
+def calculate_rr(
+    df: pd.DataFrame,
+    direction: str,
+    ob: dict | None,
+    fvg: dict | None,
+) -> tuple:
+    """
+    Calculate SL / TP1 / TP2 / RR.
+    SL placed below OB/FVG zone with ATR buffer.
+    TP1 = 1.5× SL dist | TP2 = 2.5× SL dist (liquidity target).
+
+    Returns: (entry, sl, tp1, tp2, rr1, rr2)
+    """
+    entry    = float(df["close"].iloc[-1])
+    atr      = calculate_atr(df)
+    buf      = atr * 0.5
+    highs, lows = find_swings(df)
+
+    if direction == "BULLISH":
+        sl_candidates = []
+        if ob:          sl_candidates.append(ob["low"] - buf)
+        if fvg:         sl_candidates.append(fvg["bottom"] - buf)
+        if lows:        sl_candidates.append(min(lows, key=lambda x: abs(x[1] - entry))[1] - buf)
+        sl   = min(sl_candidates) if sl_candidates else entry - atr * 2.0
+        dist = entry - sl
+        tp1  = entry + dist * RR_GRADE_B       # ≥1.5
+        tp2  = entry + dist * (RR_GRADE_A + 0.5)  # ≥2.5
+
+    else:  # BEARISH
+        sl_candidates = []
+        if ob:          sl_candidates.append(ob["high"] + buf)
+        if fvg:         sl_candidates.append(fvg["top"] + buf)
+        if highs:       sl_candidates.append(min(highs, key=lambda x: abs(x[1] - entry))[1] + buf)
+        sl   = max(sl_candidates) if sl_candidates else entry + atr * 2.0
+        dist = sl - entry
+        tp1  = entry - dist * RR_GRADE_B
+        tp2  = entry - dist * (RR_GRADE_A + 0.5)
+
+    sl_dist  = abs(entry - sl)
+    tp1_dist = abs(tp1 - entry)
+    tp2_dist = abs(tp2 - entry)
+    rr1      = round(tp1_dist / sl_dist, 2) if sl_dist > 0 else 0.0
+    rr2      = round(tp2_dist / sl_dist, 2) if sl_dist > 0 else 0.0
+
+    return entry, sl, tp1, tp2, rr1, rr2
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 13 — SCORING ENGINE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def compute_score(
+    htf_aligned:   bool,
+    liq_swept:     bool,
+    ob_or_fvg:     bool,
+    ob_and_fvg:    bool,  # Both present → extra
+    displacement:  bool,
+    vol_rat:       float,
+    session:       str,
+    rsi:           float,
+    macro_pts:     int,
+) -> tuple:
+    """
+    Build confluence score and breakdown.
+    Returns: (total_score: int, breakdown: dict)
+    """
+    bd = {
+        "htf_aligned":   SCORE_HTF_ALIGNED  if htf_aligned  else 0,
+        "liquidity":     SCORE_LIQUIDITY    if liq_swept    else 0,
+        "ob_fvg":        SCORE_OB_FVG       if ob_or_fvg    else 0,
+        "ob_fvg_bonus":  5                  if ob_and_fvg   else 0,  # Both present
+        "displacement":  SCORE_DISPLACEMENT if displacement  else 0,
+        "volume":        SCORE_VOLUME if vol_rat >= 1.5 else (2 if vol_rat >= 1.2 else 0),
+        "session":       session_score(session),
+        "rsi":           rsi_score(rsi),
+        "macro":         macro_pts,
+    }
+    total = sum(bd.values())
+    return total, bd
+
+
+def grade_signal(rr: float) -> str | None:
+    """Return 'A', 'B', or None (skip)."""
+    if rr >= RR_GRADE_A:  return "A"
+    if rr >= RR_GRADE_B:  return "B"
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 14 — COOLDOWN TRACKER
+# ═══════════════════════════════════════════════════════════════════════════
+
+# { "PAIR|label|entry_tf": last_signal_timestamp }
+_cooldown_map: dict = {}
+
+
+def is_on_cooldown(pair: str, label: str, entry_tf: str) -> bool:
+    key  = f"{pair}|{label}|{entry_tf}"
+    last = _cooldown_map.get(key)
+    if last is None:
+        return False
+    elapsed = (datetime.now(timezone.utc) - last).total_seconds() / 60
+    return elapsed < COOLDOWN_MINUTES
+
+
+def set_cooldown(pair: str, label: str, entry_tf: str):
+    key = f"{pair}|{label}|{entry_tf}"
+    _cooldown_map[key] = datetime.now(timezone.utc)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 15 — OUTPUT (JSON + TELEGRAM)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def build_signal_json(
+    pair: str, direction: str, entry: float, sl: float,
+    tp1: float, tp2: float, rr: float, score: int,
+    grade: str, reasons: list,
+) -> dict:
+    """Build the standardized JSON signal output."""
+    return {
+        "pair":        pair,
+        "direction":   "LONG" if direction == "BULLISH" else "SHORT",
+        "entry":       round(entry, 6),
+        "stop_loss":   round(sl, 6),
+        "take_profit": [round(tp1, 6), round(tp2, 6)],
+        "RR":          rr,
+        "score":       score,
+        "grade":       grade,
+        "reason":      reasons,
+    }
+
+
+def log_signal(signal: dict):
+    """Append signal to JSON log file."""
+    existing = []
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        except Exception:
+            existing = []
+    existing.append({
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        **signal,
+    })
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False)
+
+
+def send_telegram(signal: dict, mode: dict, score_bd: dict, session: str,
+                  rsi: float, btc_bias: str, btcd_trend: str, macro_reason: str):
+    """Format and send Telegram alert."""
+    pair    = signal["pair"]
+    dir_str = signal["direction"]
+    dir_em  = "🟢" if dir_str == "LONG" else "🔴"
+    grade   = signal["grade"]
+    grade_em = "🏆" if grade == "A" else "🥈"
+
+    tps = signal["take_profit"]
+    bar_filled = min(10, int(signal["score"] / 10))
+    bar = "█" * bar_filled + "░" * (10 - bar_filled)
+
+    breakdown_lines = "\n".join([
+        f"  HTF Aligned    : +{score_bd['htf_aligned']} pts",
+        f"  Liquidity      : +{score_bd['liquidity']} pts",
+        f"  OB/FVG Zone    : +{score_bd['ob_fvg']}{'+'+str(score_bd['ob_fvg_bonus']) if score_bd['ob_fvg_bonus'] else ''} pts",
+        f"  Displacement   : +{score_bd['displacement']} pts",
+        f"  Volume         : +{score_bd['volume']} pts",
+        f"  Session        : +{score_bd['session']} pts",
+        f"  RSI ({rsi:.1f})     : {'+' if score_bd['rsi']>=0 else ''}{score_bd['rsi']} pts",
+        f"  Macro          : {'+' if score_bd['macro']>=0 else ''}{score_bd['macro']} pts",
+    ])
+
+    reasons_str = "\n".join([f"  • {r}" for r in signal["reason"]])
+
+    msg = (
+        f"{dir_em} <b>{pair} — {dir_str}</b>  {grade_em} Grade {grade}\n"
+        f"{'─'*38}\n"
+        f"📊 Mode     : {mode['label']} ({mode['htf_tf']} → {mode['entry_tf']})\n"
+        f"🕐 Session  : {session}\n"
+        f"{'─'*38}\n"
+        f"💰 Entry    : <b>${signal['entry']:,.4f}</b>\n"
+        f"🛑 Stop Loss: ${signal['stop_loss']:,.4f}\n"
+        f"🎯 TP1      : ${tps[0]:,.4f}  (1:{RR_GRADE_B})\n"
+        f"🎯 TP2      : ${tps[1]:,.4f}  (1:{RR_GRADE_A+0.5:.1f})\n"
+        f"📐 RR       : 1:{signal['RR']}\n"
+        f"{'─'*38}\n"
+        f"🧮 Score    : <b>{signal['score']}/100</b>\n"
+        f"  [{bar}]\n"
+        f"{breakdown_lines}\n"
+        f"{'─'*38}\n"
+        f"📋 Reasons:\n{reasons_str}\n"
+        f"{'─'*38}\n"
+        f"🪙 BTC ({BTC_BIAS_TF}): {btc_bias} | BTC.D: {btcd_trend}\n"
+        f"  {macro_reason}\n"
+        f"{'─'*38}\n"
+        f"⚠️ Signal-only. No execution. Manage your own risk."
+    )
+
     url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": pesan, "parse_mode": "HTML"}
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
     try:
         r = requests.post(url, data=data, timeout=10)
         if r.status_code == 200:
-            print("✅ Sinyal terkirim ke Telegram!")
+            print("  ✅ Telegram sent!")
         else:
-            print(f"❌ Telegram error: {r.text}")
+            print(f"  ❌ Telegram error {r.status_code}")
     except Exception as e:
-        print(f"❌ Telegram gagal: {e}")
+        print(f"  ❌ Telegram unreachable: {e}")
 
-# ═══════════════════════════════════════════════════════════════
-# CEK PAIR — MAIN ANALYSIS
-# ═══════════════════════════════════════════════════════════════
 
-PERINGATAN_SCALPING = (
-    "\n⚠️ <b>CATATAN SCALPING:</b>\n"
-    "• Sinyal TF kecil lebih sering tapi lebih berisiko\n"
-    "• Spread & fee lebih berpengaruh di TF kecil\n"
-    "• Gunakan position size lebih kecil\n"
-    "• Pantau chart secara aktif saat entry\n"
-    "• Tidak disarankan ditinggal / unattended"
-)
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 16 — PAIR ANALYSIS (EXECUTION FLOW)
+# ═══════════════════════════════════════════════════════════════════════════
 
-def cek_pair(pair, mode, kurs_usd, sinyal_terakhir):
+def analyze_pair(
+    pair: str,
+    mode: dict,
+    df_htf: pd.DataFrame,
+    btc_bias: str,
+    btcd_trend: str,
+    session: str,
+):
+    """
+    Full SMC analysis for one pair + mode.
+    Execution flow:
+      1. Cooldown check
+      2. HTF trend → skip if ranging
+      3. Liquidity sweep → skip if none
+      4. OB or FVG → skip if neither
+      5. Compute score
+      6. Compute RR → skip if < 1.5
+      7. Score ≥ 60 → send signal
+    """
     label    = mode["label"]
-    trend_tf = mode["trend_tf"]
+    htf_tf   = mode["htf_tf"]
     entry_tf = mode["entry_tf"]
-    emoji    = mode["emoji"]
-    nama     = pair.replace("/USDT", "")
-    cfg      = STRATEGY_CONFIG[STRATEGY_MODE]
 
+    # ── Step 1: Cooldown ─────────────────────────────────────────────────
+    if is_on_cooldown(pair, label, entry_tf):
+        return
+
+    # ── Step 2: HTF Bias ─────────────────────────────────────────────────
+    htf_bias, htf_event, _, _ = get_htf_bias(df_htf)
+    if htf_bias == "RANGING":
+        print(f"  ⏭  [{label}] {pair} @ {entry_tf} — HTF ranging, skip")
+        return
+
+    trade_direction = htf_bias  # BULLISH or BEARISH
+
+    # ── Step 3: Entry TF data ─────────────────────────────────────────────
     try:
-        df_trend, _      = ambil_data(pair, trend_tf, limit=150)
-        time.sleep(0.3)
-        df_entry, sumber = ambil_data(pair, entry_tf, limit=150)
-
-        harga_usdt = df_entry['close'].iloc[-1]
-        harga_idr  = harga_usdt * kurs_usd
-
-        # ── Analisis ─────────────────────────────────────────
-        trend_besar, _, _              = deteksi_struktur(df_trend)
-        trend_entry, event_entry, s_str = deteksi_struktur(df_entry)
-
-        regime_data   = deteksi_market_regime(df_entry)
-        regime        = regime_data["regime"]
-
-        ob_list       = cari_order_block(df_entry, trend_entry)
-        fvg           = cari_fvg(df_entry, trend_entry)
-        di_ob, best_ob = harga_di_order_block(harga_usdt, ob_list)
-        di_fvg_zona   = harga_di_fvg(harga_usdt, fvg)
-
-        liq_data      = deteksi_liquidity(df_entry, trend_entry)
-        vol_ok, vol_kini, vol_avg, vol_ratio, vol_score = volume_konfirmasi(df_entry)
-
-        _, _, _, posisi_pd = hitung_pd_zone(df_entry)
-        pd_valid, pd_bobot = cek_pd_valid(trend_entry, posisi_pd, regime)
-
-        momentum      = hitung_momentum(df_entry)
-        price_beh     = deteksi_price_behavior(df_entry)
-        session_nama, session_mult = deteksi_session()
-
-        trend_sinkron = trend_besar == trend_entry and trend_besar != 'RANGING'
-        ada_struktur  = event_entry in ('BOS', 'CHoCH')
-
-        # ── Scoring ──────────────────────────────────────────
-        skor, breakdown = hitung_skor(
-            trend_sinkron, s_str,
-            liq_data, di_ob, di_fvg_zona,
-            vol_score, pd_bobot, momentum['score'],
-            price_beh['score'], session_mult,
-            regime
-        )
-
-        grade, grade_emoji = grade_sinyal(skor)
-
-        # [FIX #12] Adaptive: filter lebih ketat jika skor rendah
-        threshold = cfg["threshold"]
-        if skor >= 70:
-            # Setup kuat → kurangi filter wajib
-            harus_ada_struktur = True      # tetap wajib karena core hierarchy
-            harus_ada_zona     = di_ob or di_fvg_zona   # tapi boleh salah satu
-        else:
-            harus_ada_struktur = True
-            harus_ada_zona     = di_ob or di_fvg_zona
-
-        # Minimum grade filter per mode
-        grade_order = {"A+": 5, "A": 4, "B": 3, "C": 2, "D": 1}
-        min_grade_val = grade_order.get(cfg["min_grade"], 1)
-        grade_val     = grade_order.get(grade, 1)
-        grade_ok      = grade_val >= min_grade_val
-
-        # Tipe entry
-        tipe_entry, entry_desc = deteksi_tipe_entry(harga_usdt, ob_list, fvg, trend_entry, df_entry)
-
-        print(f"  [{label}|{trend_tf}→{entry_tf}] {nama}: "
-              f"${harga_usdt:,.4f} | {trend_besar}→{trend_entry}({event_entry}) | "
-              f"Regime:{regime} PD:{posisi_pd} Skor:{skor:.0f} Grade:{grade} "
-              f"Session:{session_nama} [{sumber}]")
-
-        # ── Entry Condition ───────────────────────────────────
-        entry_ok = (
-            skor >= threshold
-            and grade_ok
-            and harus_ada_struktur and ada_struktur
-            and harus_ada_zona
-            and pd_valid
-        )
-
-        if entry_ok:
-            arah   = "🟢 BUY (LONG)" if trend_entry == 'BULLISH' else "🔴 SELL (SHORT)"
-            key    = f"{pair}-{label}-{entry_tf}"
-            sinyal = f"{pair}-{label}-{trend_tf}-{entry_tf}-{trend_entry}-{event_entry}-{grade}"
-
-            if sinyal != sinyal_terakhir.get(key):
-                # SL/TP kontekstual
-                sl_usdt, sl_idr, tp_usdt, tp_idr, sl_pct, tp_pct, rr, rr_label = hitung_sl_tp(
-                    trend_entry, harga_usdt, ob_list, fvg,
-                    kurs_usd, regime, momentum['score'], s_str
-                )
-
-                # Zona entry info
-                zona_info = []
-                if di_ob and best_ob:
-                    zona_info.append(
-                        f"Order Block : ${best_ob['low']:,.4f} – ${best_ob['high']:,.4f}"
-                        f"\n              (Rp{best_ob['low']*kurs_usd:,.0f} – Rp{best_ob['high']*kurs_usd:,.0f})"
-                    )
-                if di_fvg_zona and fvg:
-                    zona_info.append(
-                        f"FVG         : ${fvg['bottom']:,.4f} – ${fvg['top']:,.4f}"
-                        f"\n              (Rp{fvg['bottom']*kurs_usd:,.0f} – Rp{fvg['top']*kurs_usd:,.0f})"
-                    )
-                zona_str = "\n   ".join(zona_info) if zona_info else "Breakout / Continuation Zone"
-
-                # Liquidity summary
-                liq_txt = []
-                if liq_data['external_sweep']:
-                    liq_txt.append("External Sweep ✅")
-                if liq_data['internal_sweep']:
-                    liq_txt.append("Internal Sweep ✅")
-                if liq_data['inducement']:
-                    liq_txt.append("Inducement ✅")
-                liq_str = " | ".join(liq_txt) if liq_txt else "Tidak terdeteksi"
-
-                # Breakdown skor
-                bd = breakdown
-                skor_detail = (
-                    f"Structure:{bd['core_structure']:.0f} "
-                    f"Liq:{bd['liquidity']:.0f} "
-                    f"Zone:{bd['entry_zone']:.0f} "
-                    f"Confirm:{bd['confirmation']:.0f} "
-                    f"Context:{bd['context']:.0f}"
-                )
-
-                catatan = PERINGATAN_SCALPING if label == "SCALPING" else "\n⚠️ Selalu manajemen risiko!"
-                strat_label = cfg["label"]
-
-                pesan = (
-                    f"{emoji} <b>SINYAL {label} — SMC v2</b>\n\n"
-                    f"📊 Pair      : <b>{pair} (Futures)</b>\n"
-                    f"👉 Arah      : <b>{arah}</b>\n"
-                    f"⏱️ Timeframe : <b>{trend_tf} → {entry_tf}</b>\n"
-                    f"🔌 Sumber    : <b>{sumber}</b>\n\n"
-                    f"💰 Harga     : <b>${harga_usdt:,.4f}</b>\n"
-                    f"           ≈ <b>Rp{harga_idr:,.0f}</b>\n"
-                    f"💱 Kurs      : <b>Rp{kurs_usd:,.0f}/USD</b>\n\n"
-                    f"📈 Trend {trend_tf}  : <b>{trend_besar}</b>\n"
-                    f"📉 Trend {entry_tf}  : <b>{trend_entry}</b> ({event_entry})\n"
-                    f"🏛️ Regime    : <b>{regime}</b>\n"
-                    f"🕐 Session   : <b>{session_nama}</b>\n\n"
-                    f"🧱 Zona Entry ({tipe_entry}):\n   {zona_str}\n"
-                    f"   ↳ <i>{entry_desc}</i>\n\n"
-                    f"💧 Liquidity : <b>{liq_str}</b>\n"
-                    f"📍 PD Zone   : <b>{posisi_pd}</b>\n"
-                    f"📦 Volume    : <b>{vol_ratio:.1f}x</b> rata-rata\n"
-                    f"💥 Momentum  : <b>{momentum['score']:.0f}/20</b> "
-                    f"(disp={momentum['displacement']:.2f}%)\n"
-                    f"🕯️ Price Beh : <b>{'Rejection ✅' if price_beh['rejection'] else ''}"
-                    f"{'Consol ✅' if price_beh['consolidation'] else ''}</b>\n\n"
-                    f"🏆 Grade     : <b>{grade_emoji} {grade}</b> "
-                    f"(Skor: {skor:.0f}/100+)\n"
-                    f"   [{skor_detail}]\n"
-                    f"⚙️ Mode      : <b>{strat_label}</b>\n\n"
-                    f"🛡️ Stop Loss  (-{sl_pct:.1f}%):\n"
-                    f"   <b>${sl_usdt:,.4f}</b> / Rp{sl_idr:,.0f}\n\n"
-                    f"🎯 Take Profit (+{tp_pct:.1f}%):\n"
-                    f"   <b>${tp_usdt:,.4f}</b> / Rp{tp_idr:,.0f}\n\n"
-                    f"📐 Risk/Reward : <b>1:{rr}</b> ({rr_label})"
-                    f"{catatan}"
-                )
-                kirim_telegram(pesan)
-                sinyal_terakhir[key] = sinyal
-
+        df_entry = fetch_ohlcv(pair, entry_tf, limit=200)
+        time.sleep(0.12)
     except Exception as e:
-        print(f"  ❌ [{label}] {pair} error: {e}")
+        print(f"  ❌ [{label}] {pair} @ {entry_tf} fetch failed: {e}")
+        return
 
-    return sinyal_terakhir
+    # ── Entry TF structure (must align with HTF) ──────────────────────────
+    entry_trend, entry_event, _, _ = detect_structure(df_entry)
+    if entry_trend not in (trade_direction, "RANGING"):
+        # Counter-trend on entry TF — lower quality but still scoreable
+        pass
 
-# ═══════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════
+    # ── Step 3a: Liquidity Sweep ──────────────────────────────────────────
+    liq_swept, liq_type, liq_level = detect_liquidity_sweep(df_entry, trade_direction)
+    if not liq_swept:
+        print(f"  ⏭  [{label}] {pair} @ {entry_tf} — No liquidity sweep")
+        return
 
-def jalankan_bot():
-    cfg = STRATEGY_CONFIG[STRATEGY_MODE]
-    print("=" * 65)
-    print("🤖  BOT SMC v2 — Probabilistic + Adaptive (Indonesia Ready)")
-    print("=" * 65)
-    print(f"📡 Primary        : Gate.io Futures ✅")
-    print(f"📡 Fallback        : MEXC → KuCoin Futures")
-    print(f"📊 Memantau        : {len(PAIRS)} koin")
-    print(f"⚙️  Strategy Mode  : {cfg['label']}")
-    print(f"🎯 Entry Threshold : {cfg['threshold']} / 100+")
-    print(f"🏆 Min Grade       : {cfg['min_grade']}")
-    print(f"📦 Vol Filter      : {VOLUME_MULTIPLIER}x rata-rata")
-    print(f"\n⏱️  Mode aktif:")
-    for m in MODES:
-        print(f"   {m['emoji']} {m['label']:10} | Trend: {m['trend_tf']} → Entry: {m['entry_tf']}")
+    # ── Step 4: Order Block + FVG ─────────────────────────────────────────
+    price   = float(df_entry["close"].iloc[-1])
+    ob_list = find_order_blocks(df_entry, trade_direction)
+    in_ob, best_ob = price_in_ob(price, ob_list)
+
+    fvg    = find_fvg(df_entry, trade_direction)
+    in_fvg = price_in_fvg(price, fvg)
+
+    if not in_ob and not in_fvg:
+        print(f"  ⏭  [{label}] {pair} @ {entry_tf} — No OB or FVG")
+        return
+
+    # ── Step 5: Supporting factors ───────────────────────────────────────
+    displacement = detect_displacement(df_entry, trade_direction)
+    vol_rat      = volume_ratio(df_entry)
+    rsi          = calculate_rsi(df_entry)
+    m_pts, macro_reason = macro_score(pair, trade_direction, btc_bias, btcd_trend)
+
+    # ── Step 5a: Build score ──────────────────────────────────────────────
+    score, score_bd = compute_score(
+        htf_aligned  = (htf_bias == trade_direction),
+        liq_swept    = liq_swept,
+        ob_or_fvg    = (in_ob or in_fvg),
+        ob_and_fvg   = (in_ob and in_fvg),
+        displacement = displacement,
+        vol_rat      = vol_rat,
+        session      = session,
+        rsi          = rsi,
+        macro_pts    = m_pts,
+    )
+
+    # ── Step 6: RR calculation ───────────────────────────────────────────
+    entry, sl, tp1, tp2, rr1, rr2 = calculate_rr(
+        df_entry, trade_direction,
+        best_ob if in_ob else None,
+        fvg if in_fvg else None,
+    )
+
+    grade = grade_signal(rr1)
+    if grade is None:
+        print(f"  ⛔ [{label}] {pair} @ {entry_tf} — RR {rr1} < 1.5, skip")
+        return
+
+    # ── Step 7: Score gate ────────────────────────────────────────────────
+    if score < MIN_SCORE:
+        print(f"  ⛔ [{label}] {pair} @ {entry_tf} — Score {score} < {MIN_SCORE}, skip")
+        return
+
+    # ── Build reason list ─────────────────────────────────────────────────
+    reasons = [
+        f"HTF {htf_bias} ({htf_tf}) — {htf_event or 'trend confirmed'}",
+        f"Liquidity: {liq_type} @ {liq_level:.4f}" if liq_level else f"Liquidity: {liq_type}",
+    ]
+    if in_ob and best_ob:
+        reasons.append(f"Order Block: ${best_ob['low']:.4f}–${best_ob['high']:.4f} (taps: {best_ob['taps']})")
+    if in_fvg and fvg:
+        reasons.append(f"FVG: ${fvg['bottom']:.4f}–${fvg['top']:.4f} ({fvg['fill_pct']*100:.0f}% filled)")
+    if in_ob and in_fvg:
+        reasons.append("OB + FVG confluence ✅")
+    if displacement:
+        reasons.append("Strong displacement confirmed")
+    if vol_rat >= 1.5:
+        reasons.append(f"Volume spike: {vol_rat}×")
+    if session in ("London", "New York"):
+        reasons.append(f"Prime session: {session}")
+    reasons.append(f"RSI: {rsi:.1f} → {'+' if rsi_score(rsi) >= 0 else ''}{rsi_score(rsi)} pts")
+    reasons.append(f"Macro: {macro_reason}")
+
+    # ── Build + send signal ───────────────────────────────────────────────
+    signal = build_signal_json(
+        pair=pair, direction=trade_direction,
+        entry=entry, sl=sl, tp1=tp1, tp2=tp2,
+        rr=rr1, score=score, grade=grade,
+        reasons=reasons,
+    )
+
+    print(f"\n  🚨 SIGNAL → {pair} {signal['direction']} | Score:{score} | Grade:{grade} | RR:1:{rr1}")
+    print(f"     Entry:{entry:.4f} | SL:{sl:.4f} | TP1:{tp1:.4f} | TP2:{tp2:.4f}")
+    print(f"     Reasons: {', '.join(reasons[:3])}")
+
+    log_signal(signal)
+    send_telegram(signal, mode, score_bd, session, rsi, btc_bias, btcd_trend, macro_reason)
+    set_cooldown(pair, label, entry_tf)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 17 — MAIN SCAN LOOP
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_bot():
+    print("=" * 70)
+    print("🤖  Yudhystirady CRYPTO SIGNAL BOT — Clean Modular Edition")
+    print("=" * 70)
+    print(f"📊 Pairs       : {len(PAIRS)}")
+    print(f"🔢 Modes       : {len(MODES)} (HTF → Entry TF)")
+    print(f"🧮 Score Gate  : ≥ {MIN_SCORE} pts to fire signal")
+    print(f"📐 RR Gate     : ≥ {RR_GRADE_B} (Grade B) | ≥ {RR_GRADE_A} (Grade A)")
+    print(f"⏱  Cooldown    : {COOLDOWN_MINUTES} min per pair/mode/TF")
+    print(f"📋 JSON Log    : {LOG_FILE}")
     print()
-    print("🔧 Fitur v2:")
-    print("   ✅ Probabilistic Scoring  ✅ Signal Hierarchy")
-    print("   ✅ Flexible Liquidity     ✅ Dynamic OB Zone")
-    print("   ✅ Imperfect FVG          ✅ Contextual PD")
-    print("   ✅ Multi Entry Model      ✅ Market Regime")
-    print("   ✅ Session Awareness      ✅ Contextual SL/TP")
-    print("   ✅ Momentum Filter        ✅ Adaptive Filter")
-    print("   ✅ Multi Strategy Mode    ✅ Price Behavior")
-    print("   ✅ Trade Grading (A+/A/B/C/D)")
+    print("SCORING (max ~100 pts):")
+    print(f"  +{SCORE_HTF_ALIGNED} HTF aligned | +{SCORE_LIQUIDITY} Liquidity | +{SCORE_OB_FVG} OB/FVG")
+    print(f"  +{SCORE_DISPLACEMENT} Displacement | +{SCORE_VOLUME} Volume | +{SCORE_SESSION} Session")
+    print(f"  +{SCORE_RSI_IDEAL} RSI 50–65 | +{SCORE_MACRO_ALIGNED} Macro aligned")
+    print(f"  {SCORE_RSI_PENALTY} RSI extreme | {SCORE_MACRO_CONFLICT} Macro conflict")
     print()
+    print("ℹ️  RSI and Macro are SCORING FACTORS only — they never block trades.")
+    print("=" * 70)
 
-    sinyal_terakhir = {}
+    htf_tfs_needed = list({m["htf_tf"] for m in MODES})
 
     while True:
-        print("─" * 65)
-        sesi, _ = deteksi_session()
-        print(f"🔍 Scan... [Exchange: {aktif_exchange}] [Session: {sesi}]")
-        kurs_usd = ambil_kurs_usd()
-        print(f"💱 Kurs: Rp{kurs_usd:,.0f}/USD\n")
+        ts      = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+        session = get_session()
+        print(f"\n{'─'*70}")
+        print(f"🔍 Scan [{ts}] | Session: {session} | Exchange: {_aktif_exchange}")
+
+        # ── Fetch macro data once per cycle ──────────────────────────────
+        btc_bias   = get_btc_bias()
+        btcd_series = fetch_btc_dominance_series()
+        btcd_trend  = get_btcd_trend(btcd_series)
+        print(f"🪙 BTC Bias ({BTC_BIAS_TF}): {btc_bias} | BTC.D: {btcd_trend}")
 
         for pair in PAIRS:
+            # ── Pre-fetch HTF data (shared across modes) ──────────────────
+            htf_cache: dict = {}
+            for htf_tf in htf_tfs_needed:
+                try:
+                    htf_cache[htf_tf] = fetch_ohlcv(pair, htf_tf, limit=200)
+                    time.sleep(0.1)
+                except Exception as e:
+                    print(f"  ⚠️  HTF fetch failed {pair} @ {htf_tf}: {e}")
+                    htf_cache[htf_tf] = None
+
             for mode in MODES:
-                sinyal_terakhir = cek_pair(pair, mode, kurs_usd, sinyal_terakhir)
-                time.sleep(0.5)
+                df_htf = htf_cache.get(mode["htf_tf"])
+                if df_htf is None:
+                    continue
+                try:
+                    analyze_pair(
+                        pair=pair, mode=mode, df_htf=df_htf,
+                        btc_bias=btc_bias, btcd_trend=btcd_trend,
+                        session=session,
+                    )
+                except Exception as e:
+                    print(f"  ❌ [{mode['label']}] {pair} error: {e}")
 
-        print(f"\n⏳ Menunggu 15 menit... [Exchange: {aktif_exchange}]\n")
-        time.sleep(900)
+        print(f"\n⏳ Next scan in {SCAN_INTERVAL // 60} min...")
+        time.sleep(SCAN_INTERVAL)
 
-jalankan_bot()
+
+if __name__ == "__main__":
+    run_bot()
