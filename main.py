@@ -118,7 +118,7 @@ SCORE_RSI_PENALTY    = -5      # RSI > 75 or < 25
 SCORE_MACRO_CONFLICT = -5
 
 MIN_SCORE            = 60      # Minimum score to fire signal
-COOLDOWN_MINUTES     = 120      # Per-pair cooldown in minutes
+COOLDOWN_MINUTES     = 120      # Tidak dipakai lagi — diganti Active Position Tracker
 SCAN_INTERVAL        = 120     # Seconds between full scans (15 min)
 
 # RR thresholds
@@ -777,25 +777,126 @@ def grade_signal(rr: float) -> str | None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ██  SECTION 14 — COOLDOWN TRACKER
+# ██  SECTION 14 — ACTIVE POSITION TRACKER
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  Logika: Setelah sinyal dikirim untuk PAIR + DIRECTION (LONG/SHORT),
+#  bot TIDAK akan mengirim sinyal yang sama lagi sampai posisi dianggap
+#  selesai — yaitu ketika harga pasar menembus SL atau TP2.
+#
+#  Key tracking: "PAIR|DIRECTION" (e.g. "BTC/USDT|LONG")
+#  Jika direction berubah (LONG → SHORT atau sebaliknya), posisi lama
+#  otomatis dianggap selesai dan sinyal baru boleh dikirim.
+#
+#  Struktur _active_positions:
+#  {
+#    "BTC/USDT|LONG": {
+#      "sl": 60000.0,
+#      "tp2": 70000.0,
+#      "direction": "LONG",
+#      "entry": 63000.0,
+#      "since": datetime,
+#    }, ...
+#  }
 # ═══════════════════════════════════════════════════════════════════════════
 
-# { "PAIR|label|entry_tf": last_signal_timestamp }
-_cooldown_map: dict = {}
+_active_positions: dict = {}
+
+# Fallback: maksimum durasi posisi aktif (jam) sebelum dianggap expired
+# Ini safety net agar posisi tidak "nyangkut" selamanya jika harga sideways
+MAX_POSITION_HOURS = 48
 
 
-def is_on_cooldown(pair: str, label: str, entry_tf: str) -> bool:
-    key  = f"{pair}|{label}|{entry_tf}"
-    last = _cooldown_map.get(key)
-    if last is None:
+def _position_key(pair: str, direction: str) -> str:
+    """Key unik per pair + direction."""
+    dir_str = "LONG" if direction == "BULLISH" else "SHORT"
+    return f"{pair}|{dir_str}"
+
+
+def has_active_position(pair: str, direction: str) -> bool:
+    """
+    Cek apakah ada posisi aktif untuk pair + direction ini.
+    Posisi dianggap SELESAI jika:
+      1. SL tertembus (harga melewati level SL), atau
+      2. TP2 tercapai (harga melewati level TP2), atau
+      3. Sudah melewati MAX_POSITION_HOURS jam (safety net), atau
+      4. Direction berubah (opposite signal).
+    """
+    key = _position_key(pair, direction)
+    pos = _active_positions.get(key)
+    if pos is None:
         return False
-    elapsed = (datetime.now(timezone.utc) - last).total_seconds() / 60
-    return elapsed < COOLDOWN_MINUTES
+
+    # Safety net: expired by time
+    elapsed_hours = (datetime.now(timezone.utc) - pos["since"]).total_seconds() / 3600
+    if elapsed_hours >= MAX_POSITION_HOURS:
+        print(f"  ♻️  Posisi {key} expired setelah {elapsed_hours:.1f}j — reset")
+        del _active_positions[key]
+        return False
+
+    return True
 
 
-def set_cooldown(pair: str, label: str, entry_tf: str):
-    key = f"{pair}|{label}|{entry_tf}"
-    _cooldown_map[key] = datetime.now(timezone.utc)
+def check_and_close_positions(pair: str, current_price: float):
+    """
+    Periksa semua posisi aktif untuk pair ini.
+    Jika harga sudah menembus SL atau TP2, hapus posisi (dianggap selesai).
+    Dipanggil setiap kali fetch harga terbaru.
+    """
+    for direction in ["LONG", "SHORT"]:
+        key = f"{pair}|{direction}"
+        pos = _active_positions.get(key)
+        if pos is None:
+            continue
+
+        sl  = pos["sl"]
+        tp2 = pos["tp2"]
+        closed = False
+        reason = ""
+
+        if direction == "LONG":
+            if current_price <= sl:
+                closed = True
+                reason = f"SL tertembus (harga {current_price:.4f} ≤ SL {sl:.4f})"
+            elif current_price >= tp2:
+                closed = True
+                reason = f"TP2 tercapai (harga {current_price:.4f} ≥ TP2 {tp2:.4f}) 🎯"
+        else:  # SHORT
+            if current_price >= sl:
+                closed = True
+                reason = f"SL tertembus (harga {current_price:.4f} ≥ SL {sl:.4f})"
+            elif current_price <= tp2:
+                closed = True
+                reason = f"TP2 tercapai (harga {current_price:.4f} ≤ TP2 {tp2:.4f}) 🎯"
+
+        if closed:
+            print(f"  ✅ Posisi {key} ditutup — {reason}")
+            del _active_positions[key]
+
+
+def open_position(pair: str, direction: str, entry: float, sl: float, tp2: float):
+    """
+    Catat posisi baru setelah sinyal dikirim.
+    Jika ada posisi berlawanan yang masih aktif, hapus dulu (flip).
+    """
+    dir_str     = "LONG" if direction == "BULLISH" else "SHORT"
+    opposite    = "SHORT" if dir_str == "LONG" else "LONG"
+    opp_key     = f"{pair}|{opposite}"
+
+    # Hapus posisi berlawanan jika ada (flip posisi)
+    if opp_key in _active_positions:
+        print(f"  🔄 Flip posisi {pair}: {opposite} → {dir_str}")
+        del _active_positions[opp_key]
+
+    key = _position_key(pair, direction)
+    _active_positions[key] = {
+        "direction": dir_str,
+        "entry":     entry,
+        "sl":        sl,
+        "tp2":       tp2,
+        "since":     datetime.now(timezone.utc),
+    }
+    print(f"  📌 Posisi tercatat: {key} | Entry:{entry:.4f} SL:{sl:.4f} TP2:{tp2:.4f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -910,11 +1011,7 @@ def analyze_pair(
     htf_tf   = mode["htf_tf"]
     entry_tf = mode["entry_tf"]
 
-    # ── Step 1: Cooldown ─────────────────────────────────────────────────
-    if is_on_cooldown(pair, label, entry_tf):
-        return
-
-    # ── Step 2: HTF Bias ─────────────────────────────────────────────────
+    # ── Step 1: HTF Bias (lebih awal agar tahu direction sebelum cek posisi) ─
     htf_bias, htf_event, _, _ = get_htf_bias(df_htf)
     if htf_bias == "RANGING":
         print(f"  ⏭  [{label}] {pair} @ {entry_tf} — HTF ranging, skip")
@@ -928,6 +1025,16 @@ def analyze_pair(
         time.sleep(0.12)
     except Exception as e:
         print(f"  ❌ [{label}] {pair} @ {entry_tf} fetch failed: {e}")
+        return
+
+    # ── Cek dan tutup posisi yang sudah SL/TP2 (gunakan harga terkini) ───
+    current_price = float(df_entry["close"].iloc[-1])
+    check_and_close_positions(pair, current_price)
+
+    # ── Cek posisi aktif: jika sudah ada posisi LONG/SHORT yang sama, skip ─
+    if has_active_position(pair, trade_direction):
+        dir_str = "LONG" if trade_direction == "BULLISH" else "SHORT"
+        print(f"  🚫 [{label}] {pair} @ {entry_tf} — Posisi {dir_str} masih aktif, skip")
         return
 
     # ── Entry TF structure (must align with HTF) ──────────────────────────
@@ -1023,7 +1130,7 @@ def analyze_pair(
     print(f"     Reasons: {', '.join(reasons[:3])}")
 
     send_telegram(signal, mode, score_bd, session, rsi, btc_bias, btcd_trend, macro_reason)
-    set_cooldown(pair, label, entry_tf)
+    open_position(pair, trade_direction, entry, sl, tp2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1138,7 +1245,7 @@ def run_bot():
     print(f"🔢 Modes       : {len(MODES)} (HTF → Entry TF)")
     print(f"🧮 Score Gate  : ≥ {MIN_SCORE} pts to fire signal")
     print(f"📐 RR Gate     : ≥ {RR_GRADE_B} (Grade B) | ≥ {RR_GRADE_A} (Grade A)")
-    print(f"⏱  Cooldown    : {COOLDOWN_MINUTES} min per pair/mode/TF")
+    print(f"⏱  Posisi Aktif: Sinyal ulang diblokir sampai SL/TP2 tertembus (max {MAX_POSITION_HOURS}j)")
     print(f"📡 Data Source : Binance Futures (fallback: Bybit → OKX)")
     print(f"🔔 Welcome     : {'ON' if WELCOME_ENABLED else 'OFF'}")
     print(f"📢 Target Chat : {TELEGRAM_CHAT_ID}")
