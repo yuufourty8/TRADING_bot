@@ -62,10 +62,10 @@ _tg_offset: int = 0
 PAIRS = [
     "BTC/USDT",  "ETH/USDT",   "XRP/USDT",  "SOL/USDT",
     "BNB/USDT",  "DOGE/USDT",  "ADA/USDT",  "POL/USDT",
-    "TRX/USDT",  "AVAX/USDT",  "LINK/USDT", "SHIB/USDT",
+    "TRX/USDT",  "AVAX/USDT",  "LINK/USDT", "1000SHIB/USDT",
     "TON/USDT",  "SUI/USDT",   "DOT/USDT",  "LTC/USDT",
     "BCH/USDT",  "NEAR/USDT",  "APT/USDT",  "UNI/USDT",
-    "ICP/USDT",  "PEPE/USDT",  "ETC/USDT",  "STX/USDT",
+    "ICP/USDT",  "1000PEPE/USDT",  "ETC/USDT",  "STX/USDT",
     "FIL/USDT",  "OP/USDT",    "INJ/USDT",  "IMX/USDT",
     "ARB/USDT",  "ATOM/USDT",  "VET/USDT",  "RENDER/USDT",
     "GRT/USDT",  "SAND/USDT",  "MANA/USDT", "AAVE/USDT",
@@ -136,49 +136,51 @@ RSI_PERIOD           = 14
 # ██  SECTION 2 — EXCHANGE LAYER
 # ═══════════════════════════════════════════════════════════════════════════
 
-KUCOIN_MAP = {
-    "BTC/USDT":"XBTUSDTM","ETH/USDT":"ETHUSDTM","XRP/USDT":"XRPUSDTM",
-    "SOL/USDT":"SOLUSDTM","BNB/USDT":"BNBUSDTM","DOGE/USDT":"DOGEUSDTM",
-    "ADA/USDT":"ADAUSDTM","POL/USDT":"POLUSDTM","TRX/USDT":"TRXUSDTM",
-    "AVAX/USDT":"AVAXUSDTM","LINK/USDT":"LINKUSDTM","SHIB/USDT":"SHIBUSDTM",
-    "TON/USDT":"TONUSDTM","SUI/USDT":"SUIUSDTM","DOT/USDT":"DOTUSDTM",
-    "LTC/USDT":"LTCUSDTM","BCH/USDT":"BCHUSDTM","NEAR/USDT":"NEARUSDTM",
-    "APT/USDT":"APTUSDTM","UNI/USDT":"UNIUSDTM","ICP/USDT":"ICPUSDTM",
-    "PEPE/USDT":"PEPEUSDTM","ETC/USDT":"ETCUSDTM","STX/USDT":"STXUSDTM",
-    "FIL/USDT":"FILUSDTM","OP/USDT":"OPUSDTM","INJ/USDT":"INJUSDTM",
-    "IMX/USDT":"IMXUSDTM","ARB/USDT":"ARBUSDTM","ATOM/USDT":"ATOMUSDTM",
-    "VET/USDT":"VETUSDTM","RENDER/USDT":"RENDERUSDTM","GRT/USDT":"GRTUSDTM",
-    "SAND/USDT":"SANDUSDTM","MANA/USDT":"MANAUSDTM","AAVE/USDT":"AAVEUSDTM",
-    "THETA/USDT":"THETAUSDTM","XLM/USDT":"XLMUSDTM","ALGO/USDT":"ALGOUSDTM",
-    "AXS/USDT":"AXSUSDTM","EGLD/USDT":"EGLDUSDTM","HBAR/USDT":"HBARUSDTM",
-    "QNT/USDT":"QNTUSDTM","FLOW/USDT":"FLOWUSDTM","CHZ/USDT":"CHZUSDTM",
-    "GALA/USDT":"GALAUSDTM","KAVA/USDT":"KAVAUSDTM","ZIL/USDT":"ZILUSDTM",
-    "HYPE/USDT":"HYPEUSDTM",
+# ── Binance Futures symbol overrides ─────────────────────────────────────
+# Binance Futures menggunakan nama kontrak standar ccxt, termasuk:
+# 1000SHIB/USDT dan 1000PEPE/USDT sudah tersedia native di Binance Futures
+BINANCE_SYMBOL_OVERRIDE = {
+    # Tambahkan override di sini jika ada symbol yang perlu disesuaikan
+    # Contoh: "POL/USDT": "MATIC/USDT",  # jika Binance masih listing MATIC
+}
+
+# ── Bybit Linear symbol overrides ────────────────────────────────────────
+BYBIT_SYMBOL_OVERRIDE = {
+    "1000SHIB/USDT": "1000SHIB/USDT",
+    "1000PEPE/USDT": "1000PEPE/USDT",
 }
 
 EXCHANGES = {
-    "Gate.io": ccxt.gateio({
+    "Binance": ccxt.binance({
         "enableRateLimit": True, "timeout": 15000,
         "options": {"defaultType": "future"},
     }),
-    "MEXC": ccxt.mexc({
+    "Bybit": ccxt.bybit({
+        "enableRateLimit": True, "timeout": 15000,
+        "options": {"defaultType": "linear"},
+    }),
+    "OKX": ccxt.okx({
         "enableRateLimit": True, "timeout": 15000,
         "options": {"defaultType": "swap"},
     }),
-    "KuCoin Futures": ccxt.kucoinfutures({
-        "enableRateLimit": True, "timeout": 15000,
-    }),
 }
 
-EXCHANGE_ORDER  = ["Gate.io", "MEXC", "KuCoin Futures"]
-_aktif_exchange = "Gate.io"
+EXCHANGE_ORDER  = ["Binance", "Bybit", "OKX"]
+_aktif_exchange = "Binance"
 
 
 def _convert_symbol(exchange_name: str, pair: str) -> str:
-    if exchange_name == "Gate.io":
-        return pair.replace("/", "_")
-    if exchange_name == "KuCoin Futures":
-        return KUCOIN_MAP.get(pair, pair.replace("/USDT", "USDTM"))
+    """Convert standard pair ke format symbol yang dipakai masing-masing exchange."""
+    if exchange_name == "Binance":
+        # Binance Futures ccxt menerima format 'BASE/USDT' langsung
+        return BINANCE_SYMBOL_OVERRIDE.get(pair, pair)
+    if exchange_name == "Bybit":
+        # Bybit Linear ccxt menerima format 'BASE/USDT' (linear perp)
+        return BYBIT_SYMBOL_OVERRIDE.get(pair, pair)
+    if exchange_name == "OKX":
+        # OKX Swap: BASE/USDT → BASE/USDT:USDT
+        base = pair.replace("/USDT", "")
+        return f"{base}/USDT:USDT"
     return pair
 
 
@@ -1137,6 +1139,7 @@ def run_bot():
     print(f"🧮 Score Gate  : ≥ {MIN_SCORE} pts to fire signal")
     print(f"📐 RR Gate     : ≥ {RR_GRADE_B} (Grade B) | ≥ {RR_GRADE_A} (Grade A)")
     print(f"⏱  Cooldown    : {COOLDOWN_MINUTES} min per pair/mode/TF")
+    print(f"📡 Data Source : Binance Futures (fallback: Bybit → OKX)")
     print(f"🔔 Welcome     : {'ON' if WELCOME_ENABLED else 'OFF'}")
     print(f"📢 Target Chat : {TELEGRAM_CHAT_ID}")
     print()
