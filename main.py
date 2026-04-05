@@ -1,19 +1,22 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════╗
-║         Yudhystirady SMC CRYPTO SIGNAL BOT — Clean Modular Edition       ║
+║      Yudhystirady SMC CRYPTO SIGNAL BOT — Sniper Edition v2             ║
 ║                                                                          ║
-║  OBJECTIVE: High-frequency signals without over-filtering                ║
+║  OBJECTIVE: High-quality signals with precision filtering                ║
 ║                                                                          ║
 ║  CORE RULES:                                                             ║
 ║  ✅ HTF (H1/H4) Market Structure — BOS/CHoCH — REQUIRED                 ║
-║  ✅ Liquidity Sweep (EQH/EQL + wick rejection) — REQUIRED               ║
+║  ✅ Macro HARD FILTER (BTC + BTC.D) for altcoins — BLOCKS trade         ║
+║  ✅ STRONG Liquidity Sweep ONLY (wick ratio + close rejection)           ║
 ║  ✅ Order Block OR Fair Value Gap — REQUIRED                            ║
-║  ✅ Scoring System (max 100 pts) — fire at ≥ 60                         ║
+║  ✅ LIMIT ENTRY: OB midpoint (priority) or FVG midpoint (fallback)      ║
+║  ✅ Confirmation Candle required (bullish/bearish body or engulf)        ║
+║  ✅ ATR Volatility Filter — skip low-vol or ranging markets             ║
+║  ✅ Scoring System (max 100 pts) — NORMAL ≥ 70 | SNIPER ≥ 80            ║
 ║  ✅ RSI: scoring factor ONLY, never blocks trades                       ║
-║  ✅ Macro (BTC + BTC.D): scoring factor ONLY, never blocks              ║
 ║  ✅ Session bonus: London / New York                                    ║
 ║  ✅ RR ≥ 1.5 required | Grade A ≥ 2.0 | Grade B ≥ 1.5                   ║
-║  ✅ Per-pair cooldown: 30 minutes                                       ║
+║  ✅ Correlation filter — keep only best signal per correlated group      ║
 ║  ✅ JSON output + Telegram alerts                                       ║
 ╚══════════════════════════════════════════════════════════════════════════╝
 """
@@ -97,13 +100,13 @@ ATR_PERIOD           = 14
 
 # ── Scoring Weights (total max = 100 pts) ───────────────────────────────────
 # +20 HTF trend aligned
-# +20 Liquidity sweep
+# +20 Liquidity sweep (STRONG only — weak sweeps rejected)
 # +15 Valid OB or FVG
 # +10 Strong displacement
 # +5  Volume spike
 # +5  Session (London/NY)
 # +5  RSI 50–65 (scoring only)
-# +10 Macro aligned (BTC + BTC.D, scoring only)
+# +10 Macro aligned (BTC + BTC.D — also HARD FILTER for altcoins)
 # −5  RSI extreme (>75 or <25)
 # −5  Macro conflict
 SCORE_HTF_ALIGNED    = 20
@@ -117,19 +120,48 @@ SCORE_MACRO_ALIGNED  = 10
 SCORE_RSI_PENALTY    = -5      # RSI > 75 or < 25
 SCORE_MACRO_CONFLICT = -5
 
-MIN_SCORE            = 60      # Minimum score to fire signal
-COOLDOWN_MINUTES     = 120      # Tidak dipakai lagi — diganti Active Position Tracker
-SCAN_INTERVAL        = 120     # Seconds between full scans (15 min)
+# ── Signal Quality Mode ──────────────────────────────────────────────────────
+# "NORMAL"  → MIN_SCORE_NORMAL threshold, Grade B+ allowed
+# "SNIPER"  → MIN_SCORE_SNIPER threshold, Grade A only (RR ≥ 2.0)
+SIGNAL_MODE          = "NORMAL"   # Change to "SNIPER" for max precision
+MIN_SCORE_NORMAL     = 70         # Raised from 60 → 70
+MIN_SCORE_SNIPER     = 80         # Sniper mode threshold
+MIN_SCORE            = MIN_SCORE_NORMAL if SIGNAL_MODE == "NORMAL" else MIN_SCORE_SNIPER
+
+COOLDOWN_MINUTES     = 120        # Not used — replaced by Active Position Tracker
+SCAN_INTERVAL        = 120        # Seconds between full scans
 
 # RR thresholds
 RR_GRADE_A   = 2.0
-RR_GRADE_B   = 1.5             # Minimum to take trade
+RR_GRADE_B   = 1.5               # Minimum to take trade
 
-# Macro config
+# ── Macro HARD FILTER config ─────────────────────────────────────────────────
+# BTC/ETH are exempt. For altcoins:
+#   LONG  → only if BTC = BULLISH AND BTC.D = FALLING
+#   SHORT → only if BTC = BEARISH AND BTC.D = RISING
 ALTCOIN_EXEMPTIONS   = {"BTC/USDT", "ETH/USDT"}
 BTC_BIAS_TF          = "1d"
 BTCD_SMA_PERIOD      = 20
 RSI_PERIOD           = 14
+
+# ── ATR Volatility Filter ────────────────────────────────────────────────────
+# Skip when ATR is too small relative to price (choppy / low-vol market)
+ATR_MIN_PCT          = 0.15      # Min ATR as % of current price
+
+# ── Confirmation Candle ──────────────────────────────────────────────────────
+# Last closed candle must be directionally aligned with trade
+CONFIRM_BODY_RATIO   = 0.55      # Min body / (high - low) ratio for "strong" candle
+
+# ── Correlation Groups ───────────────────────────────────────────────────────
+# Within each group, only the highest-scoring signal fires per scan cycle
+CORRELATION_GROUPS = [
+    {"DOGE/USDT", "1000SHIB/USDT", "1000PEPE/USDT", "GALA/USDT", "SAND/USDT", "MANA/USDT", "AXS/USDT", "CHZ/USDT"},
+    {"ETH/USDT",  "ARB/USDT",  "OP/USDT",   "IMX/USDT"},
+    {"SOL/USDT",  "APT/USDT",  "SUI/USDT",  "NEAR/USDT"},
+    {"AVAX/USDT", "ATOM/USDT", "DOT/USDT",  "EGLD/USDT"},
+    {"LINK/USDT", "GRT/USDT",  "RENDER/USDT"},
+    {"BNB/USDT",  "INJ/USDT",  "KAVA/USDT"},
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -249,14 +281,16 @@ def detect_structure(df: pd.DataFrame) -> tuple:
 
     if hh and hl:
         trend = "BULLISH"
-        event = "BOS" if hh else "CHoCH"
+        event = "BOS"        # Higher High + Higher Low = confirmed BOS
     elif lh and ll:
         trend = "BEARISH"
-        event = "BOS" if ll else "CHoCH"
-    elif (hh and ll) or (lh and hl):
+        event = "BOS"        # Lower High + Lower Low = confirmed BOS
+    elif hh and ll:
         trend  = "RANGING"
-        # Detect CHoCH: bullish structure broken to downside or vice versa
-        event  = "CHoCH" if (hh and ll) or (lh and hl) else None
+        event  = "CHoCH"     # Expanding structure (potential reversal signal)
+    elif lh and hl:
+        trend  = "RANGING"
+        event  = "CHoCH"     # Contracting structure (potential reversal signal)
     else:
         trend = "RANGING"
         event = None
@@ -300,8 +334,12 @@ def detect_eqh_eql(df: pd.DataFrame) -> dict:
 
 def detect_liquidity_sweep(df: pd.DataFrame, trend: str) -> tuple:
     """
-    Detect liquidity sweep: price sweeps swing H/L or EQH/EQL and rejects.
-    Rejection valid when wick > body (wick-body ratio ≥ WICK_BODY_RATIO_MIN).
+    Detect STRONG liquidity sweep only:
+      - Price must sweep a swing H/L or EQH/EQL level
+      - Candle must CLOSE with rejection back inside the level
+      - Wick-to-body ratio MUST be ≥ WICK_BODY_RATIO_MIN (hard requirement)
+
+    Weak sweeps (close rejection without wick ratio) are REJECTED.
 
     Returns: (swept: bool, sweep_type: str, level: float)
     """
@@ -327,7 +365,6 @@ def detect_liquidity_sweep(df: pd.DataFrame, trend: str) -> tuple:
 
     if trend == "BULLISH":
         eql = eq.get("eql")
-        # Check swing low sweep with rejection
         for candle in [c_prev, c]:
             swept_level = None
             if float(candle["low"]) < swing_low:
@@ -337,10 +374,9 @@ def detect_liquidity_sweep(df: pd.DataFrame, trend: str) -> tuple:
 
             if swept_level is not None:
                 close_rejected = float(candle["close"]) > swept_level * (1 - REJECTION_TOLERANCE)
+                # BOTH conditions required — no weak sweep fallback
                 if close_rejected and wick_body_ok(candle, "BULLISH"):
                     return True, "Bullish Sweep + Rejection", swept_level
-                elif close_rejected:
-                    return True, "Bullish Sweep (weak)", swept_level
 
     elif trend == "BEARISH":
         eqh = eq.get("eqh")
@@ -353,10 +389,9 @@ def detect_liquidity_sweep(df: pd.DataFrame, trend: str) -> tuple:
 
             if swept_level is not None:
                 close_rejected = float(candle["close"]) < swept_level * (1 + REJECTION_TOLERANCE)
+                # BOTH conditions required — no weak sweep fallback
                 if close_rejected and wick_body_ok(candle, "BEARISH"):
                     return True, "Bearish Sweep + Rejection", swept_level
-                elif close_rejected:
-                    return True, "Bearish Sweep (weak)", swept_level
 
     return False, None, None
 
@@ -617,9 +652,40 @@ def get_btc_bias() -> str:
         return "RANGING"
 
 
+def macro_hard_filter(pair: str, direction: str, btc_bias: str, btcd_trend: str) -> tuple:
+    """
+    HARD FILTER for altcoins based on macro alignment.
+    BTC and ETH pairs are exempt.
+
+    For altcoins:
+      LONG  → allowed ONLY if BTC = BULLISH AND BTC.D = FALLING
+      SHORT → allowed ONLY if BTC = BEARISH AND BTC.D = RISING
+
+    Returns: (allowed: bool, reason: str)
+    """
+    if pair in ALTCOIN_EXEMPTIONS:
+        return True, "BTC/ETH exempt from macro filter"
+
+    # If macro data is insufficient, allow trade (don't block on unknown)
+    if btc_bias == "RANGING" or btcd_trend == "FLAT":
+        return True, "Macro data insufficient — filter bypassed"
+
+    if direction == "BULLISH":
+        if btc_bias == "BULLISH" and btcd_trend == "FALLING":
+            return True, "Macro aligned: BTC Bull + BTC.D↓ → Alt season ✅"
+        return False, f"Macro misaligned for LONG: BTC={btc_bias}, BTC.D={btcd_trend}"
+
+    if direction == "BEARISH":
+        if btc_bias == "BEARISH" and btcd_trend == "RISING":
+            return True, "Macro aligned: BTC Bear + BTC.D↑ → Alt bleed ✅"
+        return False, f"Macro misaligned for SHORT: BTC={btc_bias}, BTC.D={btcd_trend}"
+
+    return True, "No match"
+
+
 def macro_score(pair: str, direction: str, btc_bias: str, btcd_trend: str) -> tuple:
     """
-    Macro scoring (NEVER blocks trades).
+    Macro scoring component (separate from hard filter).
       +10  Aligned: BTC Bull + BTC.D Falling (alt season) for LONG
                OR  BTC Bear + BTC.D Rising (alt bleed) for SHORT
       −5   Conflict: macro opposes direction
@@ -695,32 +761,46 @@ def calculate_rr(
     fvg: dict | None,
 ) -> tuple:
     """
-    Calculate SL / TP1 / TP2 / RR.
-    SL placed below OB/FVG zone with ATR buffer.
+    Calculate SL / TP1 / TP2 / RR using LIMIT ENTRY.
+
+    Entry logic (priority):
+      1. OB midpoint  (if OB available)
+      2. FVG midpoint (fallback if no OB)
+      3. Current close (last resort)
+
+    SL placed below/above OB or FVG zone with ATR buffer.
     TP1 = 1.5× SL dist | TP2 = 2.5× SL dist (liquidity target).
 
     Returns: (entry, sl, tp1, tp2, rr1, rr2)
     """
-    entry    = float(df["close"].iloc[-1])
-    atr      = calculate_atr(df)
-    buf      = atr * 0.5
-    highs, lows = find_swings(df)
+    market_price = float(df["close"].iloc[-1])
+    atr          = calculate_atr(df)
+    buf          = atr * 0.5
+    highs, lows  = find_swings(df)
+
+    # ── Determine limit entry ────────────────────────────────────────────
+    if ob:
+        entry = ob["mid"]          # Priority: OB midpoint
+    elif fvg:
+        entry = fvg["mid"]         # Fallback: FVG midpoint
+    else:
+        entry = market_price       # Last resort: current close
 
     if direction == "BULLISH":
         sl_candidates = []
-        if ob:          sl_candidates.append(ob["low"] - buf)
-        if fvg:         sl_candidates.append(fvg["bottom"] - buf)
-        if lows:        sl_candidates.append(min(lows, key=lambda x: abs(x[1] - entry))[1] - buf)
+        if ob:    sl_candidates.append(ob["low"] - buf)
+        if fvg:   sl_candidates.append(fvg["bottom"] - buf)
+        if lows:  sl_candidates.append(min(lows, key=lambda x: abs(x[1] - entry))[1] - buf)
         sl   = min(sl_candidates) if sl_candidates else entry - atr * 2.0
         dist = entry - sl
-        tp1  = entry + dist * RR_GRADE_B       # ≥1.5
-        tp2  = entry + dist * (RR_GRADE_A + 0.5)  # ≥2.5
+        tp1  = entry + dist * RR_GRADE_B
+        tp2  = entry + dist * (RR_GRADE_A + 0.5)
 
     else:  # BEARISH
         sl_candidates = []
-        if ob:          sl_candidates.append(ob["high"] + buf)
-        if fvg:         sl_candidates.append(fvg["top"] + buf)
-        if highs:       sl_candidates.append(min(highs, key=lambda x: abs(x[1] - entry))[1] + buf)
+        if ob:    sl_candidates.append(ob["high"] + buf)
+        if fvg:   sl_candidates.append(fvg["top"] + buf)
+        if highs: sl_candidates.append(min(highs, key=lambda x: abs(x[1] - entry))[1] + buf)
         sl   = max(sl_candidates) if sl_candidates else entry + atr * 2.0
         dist = sl - entry
         tp1  = entry - dist * RR_GRADE_B
@@ -774,6 +854,115 @@ def grade_signal(rr: float) -> str | None:
     if rr >= RR_GRADE_A:  return "A"
     if rr >= RR_GRADE_B:  return "B"
     return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 13b — MARKET CONDITION & CONFIRMATION FILTERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def check_volatility(df: pd.DataFrame) -> tuple:
+    """
+    Market Condition Filter:
+      - Low ATR relative to price → skip (choppy / compressed market)
+      - 10-candle range too tight  → skip (ranging market)
+
+    Returns: (ok: bool, reason: str)
+    """
+    atr   = calculate_atr(df)
+    price = float(df["close"].iloc[-1])
+    atr_pct = (atr / price) * 100 if price > 0 else 0.0
+
+    if atr_pct < ATR_MIN_PCT:
+        return False, f"Low volatility: ATR={atr_pct:.3f}% < {ATR_MIN_PCT}%"
+
+    recent = df.iloc[-10:]
+    r_high = float(recent["high"].max())
+    r_low  = float(recent["low"].min())
+    range_pct = ((r_high - r_low) / r_low * 100) if r_low > 0 else 0.0
+    if range_pct < ATR_MIN_PCT * 3:
+        return False, f"Ranging/choppy: 10-candle range={range_pct:.3f}%"
+
+    return True, f"Volatility OK: ATR={atr_pct:.3f}%"
+
+
+def check_confirmation_candle(df: pd.DataFrame, direction: str) -> bool:
+    """
+    Confirmation Candle Filter:
+      LONG  → last candle must be bullish with strong body OR engulfing prior candle
+      SHORT → last candle must be bearish with strong body OR engulfing prior candle
+
+    Returns: True if confirmation is present.
+    """
+    c    = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    o,  h,  l,  cl  = float(c["open"]),    float(c["high"]),    float(c["low"]),    float(c["close"])
+    po, ph, pl, pcl = float(prev["open"]), float(prev["high"]), float(prev["low"]), float(prev["close"])
+
+    candle_range = h - l
+    if candle_range < 1e-9:
+        return False
+
+    body       = abs(cl - o)
+    body_ratio = body / candle_range
+
+    if direction == "BULLISH":
+        is_bullish  = cl > o
+        strong_body = is_bullish and body_ratio >= CONFIRM_BODY_RATIO
+        engulfing   = is_bullish and cl > po and o < pcl
+        return strong_body or engulfing
+    else:
+        is_bearish  = cl < o
+        strong_body = is_bearish and body_ratio >= CONFIRM_BODY_RATIO
+        engulfing   = is_bearish and cl < po and o > pcl
+        return strong_body or engulfing
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  SECTION 13c — CORRELATION FILTER
+# ═══════════════════════════════════════════════════════════════════════════
+# Candidates are collected per scan cycle as a local list in run_bot(),
+# then passed through apply_correlation_filter() before any signals fire.
+
+def _get_correlation_group(pair: str) -> set | None:
+    """Return the correlation group containing this pair, or None."""
+    for group in CORRELATION_GROUPS:
+        if pair in group:
+            return group
+    return None
+
+
+def apply_correlation_filter(candidates: list) -> list:
+    """
+    Within each correlation group + direction, keep only the highest-scoring
+    signal (tiebreak: highest RR). Uncorrelated pairs always pass through.
+
+    Returns filtered list preserving insertion order for non-correlated pairs,
+    and appending group winners at the end.
+    """
+    surviving  = []
+    used_groups: dict = {}  # (frozenset(group), direction) → best candidate
+
+    for cand in candidates:
+        pair      = cand["pair"]
+        direction = cand["direction"]
+        group     = _get_correlation_group(pair)
+
+        if group is None:
+            surviving.append(cand)
+            continue
+
+        key      = (frozenset(group), direction)
+        existing = used_groups.get(key)
+        if existing is None:
+            used_groups[key] = cand
+        else:
+            if (cand["score"] > existing["score"] or
+                    (cand["score"] == existing["score"] and cand["rr"] > existing["rr"])):
+                used_groups[key] = cand
+
+    surviving.extend(used_groups.values())
+    return surviving
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1280,10 +1469,19 @@ def send_telegram(signal: dict, mode: dict, score_bd: dict, session: str,
     dir_em  = "🟢" if dir_str == "LONG" else "🔴"
     grade   = signal["grade"]
     grade_em = "🏆" if grade == "A" else "🥈"
+    mode_tag = f"[{SIGNAL_MODE}]" if SIGNAL_MODE == "SNIPER" else ""
 
     tps = signal["take_profit"]
     bar_filled = min(10, int(signal["score"] / 10))
     bar = "█" * bar_filled + "░" * (10 - bar_filled)
+
+    # Determine entry type label
+    if any("OB midpoint" in r for r in signal.get("reason", [])):
+        entry_type = "⚡ LIMIT @ OB Midpoint"
+    elif any("FVG midpoint" in r for r in signal.get("reason", [])):
+        entry_type = "⚡ LIMIT @ FVG Midpoint"
+    else:
+        entry_type = "⚡ LIMIT Entry"
 
     breakdown_lines = "\n".join([
         f"  HTF Aligned    : +{score_bd['htf_aligned']} pts",
@@ -1299,18 +1497,18 @@ def send_telegram(signal: dict, mode: dict, score_bd: dict, session: str,
     reasons_str = "\n".join([f"  • {r}" for r in signal["reason"]])
 
     msg = (
-        f"{dir_em} <b>{pair} — {dir_str}</b>  {grade_em} Grade {grade}\n"
+        f"{dir_em} <b>{pair} — {dir_str}</b>  {grade_em} Grade {grade} {mode_tag}\n"
         f"{'─'*38}\n"
         f"📊 Mode     : {mode['label']} ({mode['htf_tf']} → {mode['entry_tf']})\n"
         f"🕐 Session  : {session}\n"
         f"{'─'*38}\n"
-        f"💰 Entry    : <b>${signal['entry']:,.4f}</b>\n"
+        f"💰 Entry    : <b>${signal['entry']:,.4f}</b>  {entry_type}\n"
         f"🛑 Stop Loss: ${signal['stop_loss']:,.4f}\n"
         f"🎯 TP1      : ${tps[0]:,.4f}  (1:{RR_GRADE_B})\n"
         f"🎯 TP2      : ${tps[1]:,.4f}  (1:{RR_GRADE_A+0.5:.1f})\n"
         f"📐 RR       : 1:{signal['RR']}\n"
         f"{'─'*38}\n"
-        f"🧮 Score    : <b>{signal['score']}/100</b>\n"
+        f"🧮 Score    : <b>{signal['score']}/100</b>  (Gate: ≥{MIN_SCORE})\n"
         f"  [{bar}]\n"
         f"{breakdown_lines}\n"
         f"{'─'*38}\n"
@@ -1334,6 +1532,8 @@ def send_telegram(signal: dict, mode: dict, score_bd: dict, session: str,
         print(f"  ❌ Telegram unreachable: {e}")
 
 
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # ██  SECTION 16 — PAIR ANALYSIS (EXECUTION FLOW)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1345,23 +1545,30 @@ def analyze_pair(
     btc_bias: str,
     btcd_trend: str,
     session: str,
+    signal_candidates: list,
 ):
     """
-    Full SMC analysis for one pair + mode.
+    Full SMC analysis for one pair + mode. Returns early at each filter.
+
     Execution flow:
-      1. Cooldown check
-      2. HTF trend → skip if ranging
-      3. Liquidity sweep → skip if none
-      4. OB or FVG → skip if neither
-      5. Compute score
-      6. Compute RR → skip if < 1.5
-      7. Score ≥ 60 → send signal
+      1.  Active position check
+      2.  HTF trend → skip if RANGING
+      3.  Macro HARD FILTER → skip altcoins with misaligned macro
+      4.  Entry TF fetch
+      5.  ATR Volatility filter → skip low-vol / choppy
+      6.  STRONG Liquidity Sweep (wick + close rejection) → skip if none
+      7.  OB or FVG → skip if neither
+      8.  Confirmation Candle → skip if no aligned candle
+      9.  Scoring
+      10. Limit entry + RR recalculation → skip if RR < 1.5
+      11. Score gate (NORMAL ≥ 70 | SNIPER ≥ 80)
+      12. Append to signal_candidates (correlation filter applied later)
     """
     label    = mode["label"]
     htf_tf   = mode["htf_tf"]
     entry_tf = mode["entry_tf"]
 
-    # ── Step 1: HTF Bias (lebih awal agar tahu direction sebelum cek posisi) ─
+    # ── Step 1: HTF Bias ─────────────────────────────────────────────────
     htf_bias, htf_event, _, _ = get_htf_bias(df_htf)
     if htf_bias == "RANGING":
         print(f"  ⏭  [{label}] {pair} @ {entry_tf} — HTF ranging, skip")
@@ -1369,7 +1576,18 @@ def analyze_pair(
 
     trade_direction = htf_bias  # BULLISH or BEARISH
 
-    # ── Step 3: Entry TF data ─────────────────────────────────────────────
+    # ── Step 2: Active position check ────────────────────────────────────
+    # (fetch entry TF price is needed for position check — done after macro filter)
+
+    # ── Step 3: Macro HARD FILTER (altcoins only) ────────────────────────
+    macro_allowed, macro_filter_reason = macro_hard_filter(
+        pair, trade_direction, btc_bias, btcd_trend
+    )
+    if not macro_allowed:
+        print(f"  ⛔ [{label}] {pair} @ {entry_tf} — Skipped due to macro misalignment: {macro_filter_reason}")
+        return
+
+    # ── Step 4: Entry TF data ─────────────────────────────────────────────
     try:
         df_entry = fetch_ohlcv(pair, entry_tf, limit=200)
         time.sleep(0.12)
@@ -1377,29 +1595,29 @@ def analyze_pair(
         print(f"  ❌ [{label}] {pair} @ {entry_tf} fetch failed: {e}")
         return
 
-    # ── Cek dan tutup posisi yang sudah SL/TP2 (gunakan harga terkini) ───
+    # ── Check and close positions using current price ─────────────────────
     current_price = float(df_entry["close"].iloc[-1])
     check_and_close_positions(pair, current_price)
 
-    # ── Cek posisi aktif: jika sudah ada posisi LONG/SHORT yang sama, skip ─
+    # ── Active position gate ──────────────────────────────────────────────
     if has_active_position(pair, trade_direction):
         dir_str = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  🚫 [{label}] {pair} @ {entry_tf} — Posisi {dir_str} masih aktif, skip")
         return
 
-    # ── Entry TF structure (must align with HTF) ──────────────────────────
-    entry_trend, entry_event, _, _ = detect_structure(df_entry)
-    if entry_trend not in (trade_direction, "RANGING"):
-        # Counter-trend on entry TF — lower quality but still scoreable
-        pass
-
-    # ── Step 3a: Liquidity Sweep ──────────────────────────────────────────
-    liq_swept, liq_type, liq_level = detect_liquidity_sweep(df_entry, trade_direction)
-    if not liq_swept:
-        print(f"  ⏭  [{label}] {pair} @ {entry_tf} — No liquidity sweep")
+    # ── Step 5: ATR Volatility / Ranging Filter ───────────────────────────
+    vol_ok, vol_reason = check_volatility(df_entry)
+    if not vol_ok:
+        print(f"  ⛔ [{label}] {pair} @ {entry_tf} — Skipped due to low volatility or ranging market: {vol_reason}")
         return
 
-    # ── Step 4: Order Block + FVG ─────────────────────────────────────────
+    # ── Step 6: STRONG Liquidity Sweep ───────────────────────────────────
+    liq_swept, liq_type, liq_level = detect_liquidity_sweep(df_entry, trade_direction)
+    if not liq_swept:
+        print(f"  ⏭  [{label}] {pair} @ {entry_tf} — No strong liquidity sweep")
+        return
+
+    # ── Step 7: Order Block + FVG ─────────────────────────────────────────
     price   = float(df_entry["close"].iloc[-1])
     ob_list = find_order_blocks(df_entry, trade_direction)
     in_ob, best_ob = price_in_ob(price, ob_list)
@@ -1411,13 +1629,18 @@ def analyze_pair(
         print(f"  ⏭  [{label}] {pair} @ {entry_tf} — No OB or FVG")
         return
 
-    # ── Step 5: Supporting factors ───────────────────────────────────────
+    # ── Step 8: Confirmation Candle ───────────────────────────────────────
+    confirmed = check_confirmation_candle(df_entry, trade_direction)
+    if not confirmed:
+        print(f"  ⏭  [{label}] {pair} @ {entry_tf} — No confirmation candle")
+        return
+
+    # ── Step 9: Supporting factors + Scoring ─────────────────────────────
     displacement = detect_displacement(df_entry, trade_direction)
     vol_rat      = volume_ratio(df_entry)
     rsi          = calculate_rsi(df_entry)
     m_pts, macro_reason = macro_score(pair, trade_direction, btc_bias, btcd_trend)
 
-    # ── Step 5a: Build score ──────────────────────────────────────────────
     score, score_bd = compute_score(
         htf_aligned  = (htf_bias == trade_direction),
         liq_swept    = liq_swept,
@@ -1430,11 +1653,11 @@ def analyze_pair(
         macro_pts    = m_pts,
     )
 
-    # ── Step 6: RR calculation ───────────────────────────────────────────
+    # ── Step 10: Limit entry + RR ─────────────────────────────────────────
     entry, sl, tp1, tp2, rr1, rr2 = calculate_rr(
         df_entry, trade_direction,
         best_ob if in_ob else None,
-        fvg if in_fvg else None,
+        fvg    if in_fvg else None,
     )
 
     grade = grade_signal(rr1)
@@ -1442,7 +1665,12 @@ def analyze_pair(
         print(f"  ⛔ [{label}] {pair} @ {entry_tf} — RR {rr1} < 1.5, skip")
         return
 
-    # ── Step 7: Score gate ────────────────────────────────────────────────
+    # ── SNIPER mode: Grade A only ─────────────────────────────────────────
+    if SIGNAL_MODE == "SNIPER" and grade != "A":
+        print(f"  ⛔ [{label}] {pair} @ {entry_tf} — SNIPER mode: Grade {grade} rejected (need A)")
+        return
+
+    # ── Step 11: Score gate ────────────────────────────────────────────────
     if score < MIN_SCORE:
         print(f"  ⛔ [{label}] {pair} @ {entry_tf} — Score {score} < {MIN_SCORE}, skip")
         return
@@ -1453,9 +1681,11 @@ def analyze_pair(
         f"Liquidity: {liq_type} @ {liq_level:.4f}" if liq_level else f"Liquidity: {liq_type}",
     ]
     if in_ob and best_ob:
-        reasons.append(f"Order Block: ${best_ob['low']:.4f}–${best_ob['high']:.4f} (taps: {best_ob['taps']})")
+        entry_note = "OB midpoint entry" if not in_fvg else "OB midpoint priority"
+        reasons.append(f"Order Block: ${best_ob['low']:.4f}–${best_ob['high']:.4f} | {entry_note}")
     if in_fvg and fvg:
-        reasons.append(f"FVG: ${fvg['bottom']:.4f}–${fvg['top']:.4f} ({fvg['fill_pct']*100:.0f}% filled)")
+        entry_note = "FVG midpoint entry" if not in_ob else "FVG midpoint fallback"
+        reasons.append(f"FVG: ${fvg['bottom']:.4f}–${fvg['top']:.4f} ({fvg['fill_pct']*100:.0f}% filled) | {entry_note}")
     if in_ob and in_fvg:
         reasons.append("OB + FVG confluence ✅")
     if displacement:
@@ -1464,10 +1694,10 @@ def analyze_pair(
         reasons.append(f"Volume spike: {vol_rat}×")
     if session in ("London", "New York"):
         reasons.append(f"Prime session: {session}")
+    reasons.append(f"Confirmation candle: {'Bullish' if trade_direction == 'BULLISH' else 'Bearish'} body confirmed")
     reasons.append(f"RSI: {rsi:.1f} → {'+' if rsi_score(rsi) >= 0 else ''}{rsi_score(rsi)} pts")
     reasons.append(f"Macro: {macro_reason}")
 
-    # ── Build + send signal ───────────────────────────────────────────────
     signal = build_signal_json(
         pair=pair, direction=trade_direction,
         entry=entry, sl=sl, tp1=tp1, tp2=tp2,
@@ -1475,12 +1705,26 @@ def analyze_pair(
         reasons=reasons,
     )
 
-    print(f"\n  🚨 SIGNAL → {pair} {signal['direction']} | Score:{score} | Grade:{grade} | RR:1:{rr1}")
-    print(f"     Entry:{entry:.4f} | SL:{sl:.4f} | TP1:{tp1:.4f} | TP2:{tp2:.4f}")
-    print(f"     Reasons: {', '.join(reasons[:3])}")
-
-    send_telegram(signal, mode, score_bd, session, rsi, btc_bias, btcd_trend, macro_reason)
-    open_position(pair, trade_direction, entry, sl, tp2, tp1=tp1)
+    # ── Step 12: Queue for correlation filter ──────────────────────────────
+    signal_candidates.append({
+        "pair":        pair,
+        "direction":   trade_direction,
+        "score":       score,
+        "rr":          rr1,
+        "signal":      signal,
+        "mode":        mode,
+        "score_bd":    score_bd,
+        "session":     session,
+        "rsi":         rsi,
+        "btc_bias":    btc_bias,
+        "btcd_trend":  btcd_trend,
+        "macro_reason": macro_reason,
+        "entry":       entry,
+        "sl":          sl,
+        "tp1":         tp1,
+        "tp2":         tp2,
+    })
+    print(f"  📋 [{label}] {pair} @ {entry_tf} — Candidate queued | Score:{score} Grade:{grade} RR:1:{rr1} (entry:{entry:.4f})")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1589,24 +1833,30 @@ def welcome_polling_loop():
 
 def run_bot():
     print("=" * 70)
-    print("🤖  Yudhystirady CRYPTO SIGNAL BOT — Clean Modular Edition")
+    print("🤖  Yudhystirady CRYPTO SIGNAL BOT — Sniper Edition v2")
     print("=" * 70)
     print(f"📊 Pairs       : {len(PAIRS)}")
     print(f"🔢 Modes       : {len(MODES)} (HTF → Entry TF)")
+    print(f"🎯 Signal Mode : {SIGNAL_MODE}")
     print(f"🧮 Score Gate  : ≥ {MIN_SCORE} pts to fire signal")
     print(f"📐 RR Gate     : ≥ {RR_GRADE_B} (Grade B) | ≥ {RR_GRADE_A} (Grade A)")
     print(f"⏱  Posisi Aktif: Sinyal ulang diblokir sampai SL/TP2 tertembus (max {MAX_POSITION_HOURS}j)")
+    print(f"🔍 Macro Filter: HARD (altcoins blocked on misalignment)")
+    print(f"⚡ Entry Type  : LIMIT (OB midpoint priority, FVG midpoint fallback)")
     print(f"📡 Data Source : Binance Futures (fallback: Bybit → OKX)")
     print(f"🔔 Welcome     : {'ON' if WELCOME_ENABLED else 'OFF'}")
     print(f"📢 Target Chat : {TELEGRAM_CHAT_ID}")
     print()
     print("SCORING (max ~100 pts):")
-    print(f"  +{SCORE_HTF_ALIGNED} HTF aligned | +{SCORE_LIQUIDITY} Liquidity | +{SCORE_OB_FVG} OB/FVG")
+    print(f"  +{SCORE_HTF_ALIGNED} HTF aligned | +{SCORE_LIQUIDITY} Liquidity (STRONG only) | +{SCORE_OB_FVG} OB/FVG")
     print(f"  +{SCORE_DISPLACEMENT} Displacement | +{SCORE_VOLUME} Volume | +{SCORE_SESSION} Session")
     print(f"  +{SCORE_RSI_IDEAL} RSI 50–65 | +{SCORE_MACRO_ALIGNED} Macro aligned")
     print(f"  {SCORE_RSI_PENALTY} RSI extreme | {SCORE_MACRO_CONFLICT} Macro conflict")
     print()
-    print("ℹ️  RSI and Macro are SCORING FACTORS only — they never block trades.")
+    print("FILTERS ACTIVE:")
+    print("  ✅ Macro HARD FILTER (altcoins) | ✅ STRONG Sweep only")
+    print("  ✅ Confirmation candle | ✅ ATR volatility gate")
+    print("  ✅ Correlation dedup | ✅ LIMIT entry (OB/FVG mid)")
     print("=" * 70)
 
     # ── Start welcome listener di background thread ───────────────────────
@@ -1623,13 +1873,16 @@ def run_bot():
         ts      = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         session = get_session()
         print(f"\n{'─'*70}")
-        print(f"🔍 Scan [{ts}] | Session: {session} | Exchange: {_aktif_exchange}")
+        print(f"🔍 Scan [{ts}] | Session: {session} | Mode: {SIGNAL_MODE} | Exchange: {_aktif_exchange}")
 
         # ── Fetch macro data once per cycle ──────────────────────────────
         btc_bias    = get_btc_bias()
         btcd_series = fetch_btc_dominance_series()
         btcd_trend  = get_btcd_trend(btcd_series)
         print(f"🪙 BTC Bias ({BTC_BIAS_TF}): {btc_bias} | BTC.D: {btcd_trend}")
+
+        # ── Collect all passing candidates before firing ──────────────────
+        signal_candidates: list = []
 
         for pair in PAIRS:
             # ── Pre-fetch HTF data (shared across modes) ──────────────────
@@ -1651,9 +1904,33 @@ def run_bot():
                         pair=pair, mode=mode, df_htf=df_htf,
                         btc_bias=btc_bias, btcd_trend=btcd_trend,
                         session=session,
+                        signal_candidates=signal_candidates,
                     )
                 except Exception as e:
                     print(f"  ❌ [{mode['label']}] {pair} error: {e}")
+
+        # ── Apply correlation filter ──────────────────────────────────────
+        if signal_candidates:
+            filtered = apply_correlation_filter(signal_candidates)
+            skipped  = len(signal_candidates) - len(filtered)
+            if skipped > 0:
+                print(f"\n🔗 Correlation filter: {len(signal_candidates)} candidates → {len(filtered)} after dedup ({skipped} suppressed)")
+
+            # ── Fire surviving signals ────────────────────────────────────
+            for cand in filtered:
+                sig  = cand["signal"]
+                pair = cand["pair"]
+                entry, sl, tp1, tp2 = cand["entry"], cand["sl"], cand["tp1"], cand["tp2"]
+
+                print(f"\n  🚨 SIGNAL → {pair} {sig['direction']} | Score:{cand['score']} | Grade:{sig['grade']} | RR:1:{cand['rr']}")
+                print(f"     Entry:{entry:.4f} (LIMIT) | SL:{sl:.4f} | TP1:{tp1:.4f} | TP2:{tp2:.4f}")
+
+                send_telegram(
+                    sig, cand["mode"], cand["score_bd"],
+                    cand["session"], cand["rsi"],
+                    cand["btc_bias"], cand["btcd_trend"], cand["macro_reason"],
+                )
+                open_position(pair, cand["direction"], entry, sl, tp2, tp1=tp1)
 
         print(f"\n⏳ Next scan in {SCAN_INTERVAL // 60} min...")
         time.sleep(SCAN_INTERVAL)
