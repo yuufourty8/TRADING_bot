@@ -124,7 +124,7 @@ SCORE_MACRO_CONFLICT = -5
 # "NORMAL"  → MIN_SCORE_NORMAL threshold, Grade B+ allowed
 # "SNIPER"  → MIN_SCORE_SNIPER threshold, Grade A only (RR ≥ 2.0)
 SIGNAL_MODE          = "NORMAL"   # Change to "SNIPER" for max precision
-MIN_SCORE_NORMAL     = 70         # Raised from 60 → 70
+MIN_SCORE_NORMAL     = 50         # Raised from 60 → 70
 MIN_SCORE_SNIPER     = 80         # Sniper mode threshold
 MIN_SCORE            = MIN_SCORE_NORMAL if SIGNAL_MODE == "NORMAL" else MIN_SCORE_SNIPER
 
