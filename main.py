@@ -806,6 +806,243 @@ _active_positions: dict = {}
 # Ini safety net agar posisi tidak "nyangkut" selamanya jika harga sideways
 MAX_POSITION_HOURS = 48
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ██  TRADE HISTORY & PNL TRACKER
+# ═══════════════════════════════════════════════════════════════════════════
+#
+#  Setiap posisi yang ditutup (SL/TP hit) dicatat di sini.
+#  Logika PnL:
+#  - Anggap modal = 100% (tanpa leverage)
+#  - TP1 hit → tutup 50% posisi di TP1, sisa 50% lanjut ke TP2 / BE / trailing
+#  - TP2 hit → 50% sisa closed di TP2
+#  - SL hit (sebelum TP1)  → loss 100% (seluruh SL distance)
+#  - SL/BE hit (setelah TP1) → 50% sisa closed di SL (bisa minus, nol, atau plus)
+#
+#  PnL dihitung dalam % pergerakan harga (no leverage):
+#    pnl_pct = (exit_price - entry) / entry * 100   (LONG)
+#    pnl_pct = (entry - exit_price) / entry * 100   (SHORT)
+#
+# ═══════════════════════════════════════════════════════════════════════════
+
+_trade_history: list = []          # List of closed trade dicts
+_tp1_hit_positions: dict = {}      # Pair|DIR → True jika TP1 sudah kena
+
+def _pnl_pct(entry: float, exit_price: float, direction: str) -> float:
+    """Hitung % PnL tanpa leverage berdasarkan pergerakan harga."""
+    if direction == "LONG":
+        return (exit_price - entry) / entry * 100
+    else:
+        return (entry - exit_price) / entry * 100
+
+
+def record_closed_trade(
+    key: str,
+    pos: dict,
+    close_reason: str,   # "SL" | "TP1" | "TP2" | "EXPIRED"
+    close_price: float,
+):
+    """
+    Catat trade yang sudah ditutup ke history.
+    Logika split:
+      - Jika belum TP1: tutup 100% di close_price.
+      - Jika sudah TP1: tutup sisa 50% di close_price (50% sudah booking di TP1).
+    """
+    direction  = pos["direction"]
+    entry      = pos["entry"]
+    tp1        = pos.get("tp1", None)
+    tp1_hit    = _tp1_hit_positions.get(key, False)
+
+    now  = datetime.now(timezone.utc)
+    date = now.strftime("%Y-%m-%d")
+    month = now.strftime("%Y-%m")
+
+    if tp1_hit and tp1 is not None:
+        # 50% sudah closed di TP1, 50% lagi closed sekarang
+        pnl_tp1  = _pnl_pct(entry, tp1, direction) * 0.5   # 50% dari modal
+        pnl_rest = _pnl_pct(entry, close_price, direction) * 0.5
+        total_pnl = pnl_tp1 + pnl_rest
+        result    = "WIN" if total_pnl > 0 else ("LOSS" if total_pnl < 0 else "BE")
+        detail    = f"TP1(50%)={pnl_tp1:+.2f}% + {close_reason}(50%)={pnl_rest:+.2f}%"
+    else:
+        # Belum TP1 → seluruh 100% closed di harga ini
+        total_pnl = _pnl_pct(entry, close_price, direction)
+        result    = "WIN" if total_pnl > 0 else ("LOSS" if total_pnl < 0 else "BE")
+        detail    = f"{close_reason}(100%)={total_pnl:+.2f}%"
+
+    trade = {
+        "key":         key,
+        "direction":   direction,
+        "entry":       entry,
+        "close_price": close_price,
+        "close_reason": close_reason,
+        "result":      result,
+        "pnl_pct":     round(total_pnl, 2),
+        "detail":      detail,
+        "date":        date,
+        "month":       month,
+        "ts":          now.isoformat(),
+    }
+    _trade_history.append(trade)
+
+    # Bersihkan tracker TP1
+    if key in _tp1_hit_positions:
+        del _tp1_hit_positions[key]
+
+    print(f"  📝 Trade recorded: {key} | {result} | PnL: {total_pnl:+.2f}% | {detail}")
+    return trade
+
+
+def compute_stats(trades: list) -> dict:
+    """Hitung winrate, total PnL, win, loss dari list trade."""
+    if not trades:
+        return {"total": 0, "win": 0, "loss": 0, "be": 0,
+                "winrate": 0.0, "total_pnl": 0.0, "avg_win": 0.0, "avg_loss": 0.0}
+
+    wins   = [t for t in trades if t["result"] == "WIN"]
+    losses = [t for t in trades if t["result"] == "LOSS"]
+    bes    = [t for t in trades if t["result"] == "BE"]
+    total  = len(trades)
+    decided = len(wins) + len(losses)
+
+    winrate    = (len(wins) / decided * 100) if decided > 0 else 0.0
+    total_pnl  = sum(t["pnl_pct"] for t in trades)
+    avg_win    = (sum(t["pnl_pct"] for t in wins) / len(wins)) if wins else 0.0
+    avg_loss   = (sum(t["pnl_pct"] for t in losses) / len(losses)) if losses else 0.0
+
+    return {
+        "total":     total,
+        "win":       len(wins),
+        "loss":      len(losses),
+        "be":        len(bes),
+        "winrate":   round(winrate, 1),
+        "total_pnl": round(total_pnl, 2),
+        "avg_win":   round(avg_win, 2),
+        "avg_loss":  round(avg_loss, 2),
+    }
+
+
+def send_pnl_report():
+    """
+    Kirim laporan PnL ke Telegram:
+    - Floating PnL semua posisi aktif (tanpa leverage, %)
+    - Statistik daily (hari ini)
+    - Statistik monthly (bulan ini)
+    Dipanggil setiap jam oleh hourly_update_loop.
+    """
+    now   = datetime.now(timezone.utc)
+    today = now.strftime("%Y-%m-%d")
+    month = now.strftime("%Y-%m")
+
+    # ── Floating positions ────────────────────────────────────────────────
+    floating_lines = []
+    for key, pos in list(_active_positions.items()):
+        pair      = pos.get("pair", key.split("|")[0])
+        direction = pos["direction"]
+        entry     = pos["entry"]
+        tp1       = pos.get("tp1")
+        sl        = pos["sl"]
+        tp2       = pos["tp2"]
+
+        try:
+            df_tmp = fetch_ohlcv(pair, "15m", limit=5)
+            current = float(df_tmp["close"].iloc[-1])
+        except Exception:
+            current = None
+
+        if current is None:
+            floating_lines.append(f"  {'🟢' if direction=='LONG' else '🔴'} {pair} {direction} — harga tidak tersedia")
+            continue
+
+        tp1_hit = _tp1_hit_positions.get(key, False)
+        float_pct = _pnl_pct(entry, current, direction)
+
+        if tp1_hit and tp1:
+            # 50% sudah booking di TP1
+            pnl_tp1_part = _pnl_pct(entry, tp1, direction) * 0.5
+            pnl_float    = _pnl_pct(entry, current, direction) * 0.5
+            net_float    = pnl_tp1_part + pnl_float
+            tp1_tag      = f"✅TP1 hit | Sisa 50% float"
+            float_tag    = f"{net_float:+.2f}% net"
+        else:
+            net_float = float_pct
+            tp1_tag   = ""
+            float_tag = f"{net_float:+.2f}%"
+
+        emoji  = "🟢" if direction == "LONG" else "🔴"
+        fl_em  = "📈" if net_float >= 0 else "📉"
+        elapsed = (now - pos["since"]).total_seconds() / 3600
+
+        floating_lines.append(
+            f"  {emoji} <b>{pair}</b> {direction}  {fl_em} {float_tag}\n"
+            f"     Entry: {entry:.4f} → Now: {current:.4f}  |  {elapsed:.1f}j berjalan\n"
+            f"     SL: {sl:.4f}  TP1: {tp1:.4f}  TP2: {tp2:.4f}"
+            + (f"\n     {tp1_tag}" if tp1_tag else "")
+        )
+        time.sleep(0.1)
+
+    # ── Daily & Monthly stats ─────────────────────────────────────────────
+    daily_trades   = [t for t in _trade_history if t["date"] == today]
+    monthly_trades = [t for t in _trade_history if t["month"] == month]
+    daily_stats    = compute_stats(daily_trades)
+    monthly_stats  = compute_stats(monthly_trades)
+
+    def stat_block(label: str, s: dict) -> str:
+        if s["total"] == 0:
+            return f"  📭 {label}: Belum ada trade selesai"
+        bar = "█" * min(10, int(s["winrate"] / 10)) + "░" * max(0, 10 - int(s["winrate"] / 10))
+        pnl_em = "🟢" if s["total_pnl"] >= 0 else "🔴"
+        return (
+            f"  📊 <b>{label}</b>\n"
+            f"  [{bar}] Winrate: <b>{s['winrate']}%</b>\n"
+            f"  ✅ Win: {s['win']}  ❌ Loss: {s['loss']}  〰️ BE: {s['be']}  |  Total: {s['total']}\n"
+            f"  {pnl_em} Net PnL: <b>{s['total_pnl']:+.2f}%</b>  (Avg W: {s['avg_win']:+.2f}%  L: {s['avg_loss']:+.2f}%)"
+        )
+
+    # ── Assemble message ──────────────────────────────────────────────────
+    fl_section = "\n".join(floating_lines) if floating_lines else "  📭 Tidak ada posisi aktif saat ini"
+
+    msg = (
+        f"⏰ <b>UPDATE PnL — {now.strftime('%d %b %Y %H:%M UTC')}</b>\n"
+        f"{'═'*38}\n"
+        f"\n📌 <b>POSISI AKTIF (Floating)</b>\n"
+        f"{fl_section}\n"
+        f"{'─'*38}\n"
+        f"\n{stat_block('DAILY  (' + today + ')', daily_stats)}\n"
+        f"{'─'*38}\n"
+        f"\n{stat_block('MONTHLY (' + month + ')', monthly_stats)}\n"
+        f"{'═'*38}\n"
+        f"⚠️ PnL dihitung tanpa leverage. TP1=50% booking, sisa 50% running."
+    )
+
+    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    try:
+        r = requests.post(url, data=data, timeout=10)
+        if r.status_code == 200:
+            print(f"  ✅ PnL report sent [{now.strftime('%H:%M')}]")
+        else:
+            print(f"  ❌ PnL report error {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"  ❌ PnL report unreachable: {e}")
+
+
+def hourly_update_loop():
+    """
+    Background thread: kirim PnL update setiap jam tepat (XX:00 UTC).
+    """
+    print("⏱️  Hourly PnL update loop aktif...")
+    while True:
+        now     = datetime.now(timezone.utc)
+        # Tunggu sampai menit 0 dari jam berikutnya
+        minutes_left = 60 - now.minute
+        seconds_left = minutes_left * 60 - now.second
+        print(f"  ⏳ Hourly update berikutnya dalam {minutes_left} menit...")
+        time.sleep(seconds_left)
+        try:
+            send_pnl_report()
+        except Exception as e:
+            print(f"  ⚠️  Hourly update error: {e}")
+
 
 def _position_key(pair: str, direction: str) -> str:
     """Key unik per pair + direction."""
@@ -831,17 +1068,65 @@ def has_active_position(pair: str, direction: str) -> bool:
     elapsed_hours = (datetime.now(timezone.utc) - pos["since"]).total_seconds() / 3600
     if elapsed_hours >= MAX_POSITION_HOURS:
         print(f"  ♻️  Posisi {key} expired setelah {elapsed_hours:.1f}j — reset")
+        # Fetch current price untuk record
+        try:
+            df_exp = fetch_ohlcv(pos.get("pair", pair), "15m", limit=5)
+            exp_price = float(df_exp["close"].iloc[-1])
+        except Exception:
+            exp_price = pos["entry"]  # fallback ke entry jika fetch gagal
+        record_closed_trade(key, pos, "EXPIRED", exp_price)
         del _active_positions[key]
         return False
 
     return True
 
 
+def _send_close_notification(key: str, trade: dict):
+    """Kirim notif ke Telegram saat posisi ditutup (SL/TP hit)."""
+    direction = trade["direction"]
+    result    = trade["result"]
+    pnl       = trade["pnl_pct"]
+    reason    = trade["close_reason"]
+    detail    = trade["detail"]
+
+    if result == "WIN":
+        em = "🏆 WIN"
+    elif result == "LOSS":
+        em = "💔 LOSS"
+    else:
+        em = "〰️ BREAK EVEN"
+
+    dir_em = "🟢" if direction == "LONG" else "🔴"
+    pnl_em = "📈" if pnl >= 0 else "📉"
+
+    pair = key.split("|")[0]
+    msg  = (
+        f"{'─'*38}\n"
+        f"{dir_em} <b>{pair} {direction}</b> — {em}\n"
+        f"{'─'*38}\n"
+        f"🔒 Ditutup  : <b>{reason}</b>\n"
+        f"💰 Entry    : {trade['entry']:.4f}\n"
+        f"📍 Exit     : {trade['close_price']:.4f}\n"
+        f"{pnl_em} PnL       : <b>{pnl:+.2f}%</b> (no leverage)\n"
+        f"📋 Detail   : {detail}\n"
+        f"{'─'*38}\n"
+        f"⏱️ Waktu    : {trade['ts'][:19].replace('T',' ')} UTC"
+    )
+    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    try:
+        requests.post(url, data=data, timeout=10)
+    except Exception as e:
+        print(f"  ⚠️  Close notif error: {e}")
+
+
 def check_and_close_positions(pair: str, current_price: float):
     """
     Periksa semua posisi aktif untuk pair ini.
-    Jika harga sudah menembus SL atau TP2, hapus posisi (dianggap selesai).
-    Dipanggil setiap kali fetch harga terbaru.
+    Urutan cek:
+      1. SL hit → closed 100% (atau 50% jika TP1 sudah hit sebelumnya)
+      2. TP1 hit → booking 50%, pasang break-even SL (SL digeser ke entry)
+      3. TP2 hit → closed sisa 50%
     """
     for direction in ["LONG", "SHORT"]:
         key = f"{pair}|{direction}"
@@ -849,32 +1134,92 @@ def check_and_close_positions(pair: str, current_price: float):
         if pos is None:
             continue
 
-        sl  = pos["sl"]
-        tp2 = pos["tp2"]
-        closed = False
-        reason = ""
+        sl    = pos["sl"]
+        tp1   = pos.get("tp1")
+        tp2   = pos["tp2"]
+        entry = pos["entry"]
+        tp1_hit = _tp1_hit_positions.get(key, False)
+
+        closed      = False
+        close_reason = ""
 
         if direction == "LONG":
+            # ── SL check ─────────────────────────────────────────────────
             if current_price <= sl:
                 closed = True
-                reason = f"SL tertembus (harga {current_price:.4f} ≤ SL {sl:.4f})"
-            elif current_price >= tp2:
+                close_reason = "SL"
+                print(f"  🛑 {key}: SL tertembus @ {current_price:.4f} (SL:{sl:.4f})")
+
+            # ── TP1 check (booking 50% jika belum pernah hit) ─────────────
+            elif tp1 and not tp1_hit and current_price >= tp1:
+                _tp1_hit_positions[key] = True
+                # Geser SL ke entry (break-even)
+                _active_positions[key]["sl"] = entry
+                print(f"  🎯 {key}: TP1 hit @ {current_price:.4f} — 50% booking, SL → BE ({entry:.4f})")
+                # Kirim notif TP1 partial
+                pnl_partial = _pnl_pct(entry, tp1, direction) * 0.5
+                msg_tp1 = (
+                    f"🎯 <b>{pair} {direction} — TP1 HIT</b>\n"
+                    f"{'─'*38}\n"
+                    f"✅ 50% posisi booking di TP1: {tp1:.4f}\n"
+                    f"📈 Partial PnL: <b>{pnl_partial:+.2f}%</b>\n"
+                    f"🔄 SL digeser ke Break-Even: {entry:.4f}\n"
+                    f"🎯 Sisa 50% menuju TP2: {tp2:.4f}"
+                )
+                url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg_tp1, "parse_mode": "HTML"}
+                try:
+                    requests.post(url, data=data, timeout=10)
+                except Exception:
+                    pass
+
+            # ── TP2 check (hanya jika TP1 sudah hit) ─────────────────────
+            elif tp1_hit and current_price >= tp2:
                 closed = True
-                reason = f"TP2 tercapai (harga {current_price:.4f} ≥ TP2 {tp2:.4f}) 🎯"
+                close_reason = "TP2"
+                print(f"  🏆 {key}: TP2 hit @ {current_price:.4f} (TP2:{tp2:.4f})")
+
         else:  # SHORT
+            # ── SL check ─────────────────────────────────────────────────
             if current_price >= sl:
                 closed = True
-                reason = f"SL tertembus (harga {current_price:.4f} ≥ SL {sl:.4f})"
-            elif current_price <= tp2:
+                close_reason = "SL"
+                print(f"  🛑 {key}: SL tertembus @ {current_price:.4f} (SL:{sl:.4f})")
+
+            # ── TP1 check ─────────────────────────────────────────────────
+            elif tp1 and not tp1_hit and current_price <= tp1:
+                _tp1_hit_positions[key] = True
+                _active_positions[key]["sl"] = entry
+                print(f"  🎯 {key}: TP1 hit @ {current_price:.4f} — 50% booking, SL → BE ({entry:.4f})")
+                pnl_partial = _pnl_pct(entry, tp1, direction) * 0.5
+                msg_tp1 = (
+                    f"🎯 <b>{pair} {direction} — TP1 HIT</b>\n"
+                    f"{'─'*38}\n"
+                    f"✅ 50% posisi booking di TP1: {tp1:.4f}\n"
+                    f"📈 Partial PnL: <b>{pnl_partial:+.2f}%</b>\n"
+                    f"🔄 SL digeser ke Break-Even: {entry:.4f}\n"
+                    f"🎯 Sisa 50% menuju TP2: {tp2:.4f}"
+                )
+                url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg_tp1, "parse_mode": "HTML"}
+                try:
+                    requests.post(url, data=data, timeout=10)
+                except Exception:
+                    pass
+
+            # ── TP2 check ─────────────────────────────────────────────────
+            elif tp1_hit and current_price <= tp2:
                 closed = True
-                reason = f"TP2 tercapai (harga {current_price:.4f} ≤ TP2 {tp2:.4f}) 🎯"
+                close_reason = "TP2"
+                print(f"  🏆 {key}: TP2 hit @ {current_price:.4f} (TP2:{tp2:.4f})")
 
         if closed:
-            print(f"  ✅ Posisi {key} ditutup — {reason}")
+            trade = record_closed_trade(key, pos, close_reason, current_price)
+            _send_close_notification(key, trade)
             del _active_positions[key]
 
 
-def open_position(pair: str, direction: str, entry: float, sl: float, tp2: float):
+def open_position(pair: str, direction: str, entry: float, sl: float, tp2: float, tp1: float = None):
     """
     Catat posisi baru setelah sinyal dikirim.
     Jika ada posisi berlawanan yang masih aktif, hapus dulu (flip).
@@ -886,17 +1231,22 @@ def open_position(pair: str, direction: str, entry: float, sl: float, tp2: float
     # Hapus posisi berlawanan jika ada (flip posisi)
     if opp_key in _active_positions:
         print(f"  🔄 Flip posisi {pair}: {opposite} → {dir_str}")
+        pos_old = _active_positions[opp_key]
+        # Anggap closed di harga entry signal baru (aproximasi)
+        record_closed_trade(opp_key, pos_old, "FLIP", entry)
         del _active_positions[opp_key]
 
     key = _position_key(pair, direction)
     _active_positions[key] = {
+        "pair":      pair,
         "direction": dir_str,
         "entry":     entry,
         "sl":        sl,
+        "tp1":       tp1,
         "tp2":       tp2,
         "since":     datetime.now(timezone.utc),
     }
-    print(f"  📌 Posisi tercatat: {key} | Entry:{entry:.4f} SL:{sl:.4f} TP2:{tp2:.4f}")
+    print(f"  📌 Posisi tercatat: {key} | Entry:{entry:.4f} SL:{sl:.4f} TP1:{tp1:.4f if tp1 else 'N/A'} TP2:{tp2:.4f}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1130,7 +1480,7 @@ def analyze_pair(
     print(f"     Reasons: {', '.join(reasons[:3])}")
 
     send_telegram(signal, mode, score_bd, session, rsi, btc_bias, btcd_trend, macro_reason)
-    open_position(pair, trade_direction, entry, sl, tp2)
+    open_position(pair, trade_direction, entry, sl, tp2, tp1=tp1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1262,6 +1612,10 @@ def run_bot():
     # ── Start welcome listener di background thread ───────────────────────
     tg_thread = threading.Thread(target=welcome_polling_loop, daemon=True)
     tg_thread.start()
+
+    # ── Start hourly PnL update thread ───────────────────────────────────
+    pnl_thread = threading.Thread(target=hourly_update_loop, daemon=True)
+    pnl_thread.start()
 
     htf_tfs_needed = list({m["htf_tf"] for m in MODES})
 
